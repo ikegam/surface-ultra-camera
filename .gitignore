@@ -1,0 +1,17 @@
+# kernel build output
+*.o
+*.ko
+*.mod
+*.mod.c
+.*.cmd
+modules.order
+Module.symvers
+.module-common.o
+# rust
+/sucamd/target/
+# never commit the NVIDIA firmware
+/firmware/*.img
+/firmware/*.bin
+# captured frames
+*.raw
+*.yuyv

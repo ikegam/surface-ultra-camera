@@ -1,0 +1,17 @@
+[Unit]
+Description=Surface Laptop Ultra camera (raw sensor -> v4l2loopback webcam)
+After=systemd-modules-load.service
+
+[Service]
+ExecStart=/usr/local/bin/sucamd
+Restart=always
+RestartSec=3
+DynamicUser=yes
+SupplementaryGroups=video
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
