@@ -1,10 +1,12 @@
 /*
- * ccusnoop v3 - Surface Laptop Ultra (N1X) CCU mailbox snooper + full camera register dumper.
+ * ccusnoop v4 - Surface Laptop Ultra (N1X) CCU mailbox snooper + full camera register dumper.
  *
  * 1) Polls both CCU mailboxes (0x3C0BC0C8 / 0x3C0CC0C8), logs every command (ft/cmd/payload).
- * 2) Every ~1s (and on unload) dumps the WHOLE direct-MMIO camera path so one capture has
- *    everything: rxanaA/B, dphy, mac_top, mac_csi, seninf-top, async, outmux0..13, camsv0/1.
- *    The snapshots taken while the Camera app is previewing are the golden config to replay.
+ * 2) Once the camera becomes active (first mailbox command), every ~1s (and on unload) dumps
+ *    the WHOLE direct-MMIO camera path: CSI ports 0-2 (rxanaA/B, dphy, mac_top, mac_csi),
+ *    seninf-top, async, outmux0..13, camsv_a/b/e. Snapshots taken while a camera streams are
+ *    the golden config to replay. v4 adds ports 1/2 and camsv_e for the IR camera (port 2);
+ *    those are only read after camera activity, in case an unclocked block stalls the bus.
  *
  * Output -> C:\ccusnoop.log (also DbgPrint).
  *   sc create ccusnoop type= kernel binPath= C:\ccusnoop\...\ccusnoop.sys
@@ -24,14 +26,15 @@
 #define PL_MAX 0x11C
 #define LOGSZ (4 * 1024 * 1024)
 
-#define SENINF_BASE 0x12A10000ULL   /* rxanaA@0 rxanaB@0x1000 dphy@0x2000 mac_top@0x4000 mac_csi@0x5000 */
-#define SENINF_SIZE 0x8000
+#define SENINF_BASE 0x12A10000ULL   /* per port (stride 0x8000): rxanaA@0 rxanaB@0x1000 dphy@0x2000 mac_top@0x4000 mac_csi@0x5000 */
+#define SENINF_SIZE 0x18000
+#define PORT_STRIDE 0x8000
 #define TOP_BASE    0x3A300000ULL   /* seninf-top@0 async@0x1000 tg@0x2000 */
 #define TOP_SIZE    0x3000
 #define OMUX_BASE   0x3A100000ULL   /* outmux0..13 stride 0x10000 */
 #define OMUX_SIZE   0xE0000
-#define CAMSV_BASE  0x3A500000ULL   /* camsv0@0 camsv1@0x10000 */
-#define CAMSV_SIZE  0x20000
+#define CAMSV_BASE  0x3A500000ULL   /* camsv_a@0 camsv_b@0x10000 camsv_e@0x40000 */
+#define CAMSV_SIZE  0x50000
 
 static PVOID g_ccu, g_seninf, g_top, g_omux, g_camsv;
 static PKTHREAD g_thread;
@@ -39,6 +42,7 @@ static BOOLEAN g_stop;
 static char *g_log;
 static ULONG g_logpos;
 static int g_dumpseq;
+static BOOLEAN g_active;		/* a mailbox command has been seen: camera blocks are clocked */
 
 static const ULONG MB_HDR[2] = { 0x3C0C8, 0x4C0C8 };
 static const ULONG MB_PL[2]  = { 0x3C0E4, 0x4C0E4 };
@@ -95,14 +99,31 @@ static void dump_regs(void)
 
 	RtlStringCbPrintfA(hdr, sizeof(hdr), "=== DUMP #%d ===", g_dumpseq++);
 	logline(hdr);
-	dumpblk("rxanaA", g_seninf, 0x0000, 0x40);
-	dumpblk("rxanaA", g_seninf, 0x00f0, 0x8);
-	dumpblk("rxanaA", g_seninf, 0x0100, 0x8);
-	dumpblk("rxanaB", g_seninf, 0x1000, 0x40);
-	dumpblk("rxanaB", g_seninf, 0x10f0, 0x8);
-	dumpblk("dphy",   g_seninf, 0x2000, 0x80);
-	dumpblk("mactop", g_seninf, 0x4000, 0x40);
-	dumpblk("maccsi", g_seninf, 0x5000, 0x80);
+	/* CSI ports: port 0 always (as in v3), ports 1/2 only once the camera is active */
+	{
+		int p;
+
+		for (p = 0; p < 3; p++) {
+			ULONG b = (ULONG)p * PORT_STRIDE;
+			char t[16];
+
+			if (p && !g_active)
+				break;
+			RtlStringCbPrintfA(t, sizeof(t), "p%d.rxanaA", p);
+			dumpblk(t, g_seninf, b + 0x0000, 0x40);
+			dumpblk(t, g_seninf, b + 0x00f0, 0x8);
+			dumpblk(t, g_seninf, b + 0x0100, 0x8);
+			RtlStringCbPrintfA(t, sizeof(t), "p%d.rxanaB", p);
+			dumpblk(t, g_seninf, b + 0x1000, 0x40);
+			dumpblk(t, g_seninf, b + 0x10f0, 0x8);
+			RtlStringCbPrintfA(t, sizeof(t), "p%d.dphy", p);
+			dumpblk(t, g_seninf, b + 0x2000, 0x80);
+			RtlStringCbPrintfA(t, sizeof(t), "p%d.mactop", p);
+			dumpblk(t, g_seninf, b + 0x4000, 0x40);
+			RtlStringCbPrintfA(t, sizeof(t), "p%d.maccsi", p);
+			dumpblk(t, g_seninf, b + 0x5000, 0x80);
+		}
+	}
 	dumpblk("sntop",  g_top,    0x0000, 0x40);
 	dumpblk("async",  g_top,    0x1000, 0x40);
 	dumpblk("tg",     g_top,    0x2000, 0x20);
@@ -118,13 +139,18 @@ static void dump_regs(void)
 			dumpblk(t, g_omux, (ULONG)n * 0x10000 + 0x80, 0x10);
 		}
 	}
-	/* camsv0 and camsv1: FULL central (0..0x600) + DMATOP (0x1000..0x1400) + SCQ */
+	/* camsv_a/b (as in v3) and camsv_e (after activity): central + DMATOP + SCQ */
 	dumpblk("camsv0",     g_camsv, 0x0000, 0x180);
 	dumpblk("camsv0dma",  g_camsv, 0x1000, 0x100);
 	dumpblk("camsv0scq",  g_camsv, 0x2000, 0x40);
 	dumpblk("camsv1",     g_camsv, 0x10000, 0x180);
 	dumpblk("camsv1dma",  g_camsv, 0x11000, 0x100);
 	dumpblk("camsv1scq",  g_camsv, 0x12000, 0x40);
+	if (g_active) {
+		dumpblk("camsv4",     g_camsv, 0x40000, 0x180);
+		dumpblk("camsv4dma",  g_camsv, 0x41000, 0x100);
+		dumpblk("camsv4scq",  g_camsv, 0x42000, 0x40);
+	}
 	/* outmux0,1 wider (0..0x200) */
 	dumpblk("omux0w", g_omux, 0x00, 0x80);
 	dumpblk("omux1w", g_omux, 0x10000, 0x80);
@@ -140,7 +166,7 @@ static VOID PollThread(PVOID ctx)
 	int m;
 
 	UNREFERENCED_PARAMETER(ctx);
-	logline("ccusnoop v3: poll start");
+	logline("ccusnoop v4: poll start");
 	while (!g_stop) {
 		for (m = 0; m < 2; m++) {
 			ULONG hdr = MB_HDR[m];
@@ -165,18 +191,22 @@ static VOID PollThread(PVOID ctx)
 				}
 				logline(buf);
 				DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "ccusnoop: %s\n", buf);
+				if (lastw[m] != 0xFFFFFFFF && !g_active) {
+					g_active = TRUE;		/* first real command: start dumping */
+					next_dump = iter + 400000;	/* ~0.5s, let stream-on settle */
+				}
 				lastw[m] = w;
 			}
 		}
-		/* periodic full register dump (~1s), up to 12 times */
-		if (iter >= next_dump && g_dumpseq < 12) {
+		/* one dump at load, then every ~1s once the camera is active, up to 30 times */
+		if (iter >= next_dump && g_dumpseq < 30 && (g_active || g_dumpseq == 0)) {
 			dump_regs();
 			next_dump = iter + 800000;
 		}
 		iter++;
 		KeStallExecutionProcessor(1);
 	}
-	logline("ccusnoop v3: poll stop");
+	logline("ccusnoop v4: poll stop");
 }
 
 static void flush_file(void)
@@ -251,7 +281,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
 		ZwClose(h);
 	}
 	DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-		"ccusnoop v3: loaded ccu=%p seninf=%p top=%p omux=%p camsv=%p\n",
+		"ccusnoop v4: loaded ccu=%p seninf=%p top=%p omux=%p camsv=%p\n",
 		g_ccu, g_seninf, g_top, g_omux, g_camsv);
 	return STATUS_SUCCESS;
 }

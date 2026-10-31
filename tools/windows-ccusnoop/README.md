@@ -9,9 +9,12 @@ records two things:
 1. It polls the CCU RPC mailbox (physical address `0x3C0BC0C8`, and the second
    mailbox at `0x3C0CC0C8`) and records every command Windows sends (feature,
    command id, length, status, payload).
-2. Every second, it dumps the camera blocks the CPU can see directly: rxana,
-   D-PHY, mac_top, mac_csi, seninf-top/async (protected, so they read as 0),
-   all 14 outmuxes, and camsv a/b (including their DMA blocks).
+2. Once a camera starts, every second (up to 30 times), it dumps the camera
+   blocks the CPU can see directly: rxana, D-PHY, mac_top and mac_csi of CSI
+   ports 0-2, seninf-top/async (protected, so they read as 0), all 14
+   outmuxes, and camsv a/b/e (including their DMA blocks). Ports 1/2 and
+   camsv_e are only read after a camera has started, to avoid hanging on an
+   unclocked block.
 
 The log is written to `C:\ccusnoop.log` when the driver is stopped. It only
 reads and never writes anything to the hardware.
@@ -62,6 +65,12 @@ Open the Windows Camera app and keep the preview running for a few seconds
 sc stop ccusnoop
 sc delete ccusnoop
 ```
+
+To capture the IR camera (CSI port 2), do not open the Camera app. Open
+Settings > Accounts > Sign-in options > Facial recognition (Windows Hello) >
+"Improve recognition", keep your face in view for 20-30 seconds, then stop
+the driver. If the front camera starts first, it uses up the dumps. In
+PowerShell, `sc` is an alias for another command, so type `sc.exe`.
 
 Stopping it while the camera streams makes the last dump a streaming-state
 snapshot. The polling keeps one CPU core busy, so stop it when you are done,
