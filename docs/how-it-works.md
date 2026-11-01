@@ -122,16 +122,21 @@ camsv_b (TAG2, written by WDMA IMG2).
 
 ## Frame delivery
 
-The driver does not use the camsv interrupts yet. A kernel thread polls every
-1 ms:
+The driver runs from camsv_b's SOF interrupt (GSI `0x20D` in ISP1's `_CRS`,
+enabled with `SOF_STATUS_EN 0x35C` = `0x40` as on Windows). The interrupt is
+only registered while streaming, because at other times the camsv is unpowered
+and reading it stalls the bus. If the interrupt is unavailable, or with the
+module parameter `poll=1`, a kernel thread polls every 1 ms instead. Each
+interrupt does the following, in order:
 
+- **Done**: if the FBC write count (bits 15:8 of `FBC1_TAG2 0x584`) has moved,
+  the "writing" buffer is returned to user space. A frame finishes being
+  written before the next SOF, so checking at SOF is enough.
 - **SOF** (bit 6 of `SOF_STATUS 0x360` is TAG2; it clears on read): the outer
   WDMA address register has just been latched for the new frame. The buffer
   that was "pending" moves to "writing", and the next queued buffer is set up
   right away (its address plus one FBC credit with `RCNT_INC`). This gives a
   whole frame time to set up the next buffer.
-- **Done**: when the FBC write count (bits 15:8 of `FBC1_TAG2 0x584`) moves,
-  the "writing" buffer is returned to user space.
 
 When no buffer is queued the FBC has no credit, so the hardware drops the frame
 instead of overwriting a buffer the application is holding.
