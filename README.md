@@ -18,7 +18,7 @@ affiliated with Microsoft, NVIDIA or MediaTek.
 | Auto exposure / white balance / noise reduction / anti-flicker | **Works** (in software, `sucamd`) |
 | Privacy LED | On only while an application is using the camera |
 | Suspend / resume | Works |
-| IR camera (ST VD55G1, Windows Hello) | Not supported yet |
+| IR camera (ST VD55G1) | **Works**: **"Surface IR Camera"**, 640x480 grey, 30 fps, with the IR LED. Not at the same time as the front camera. Face authentication (as Windows Hello does) is out of scope |
 
 Tested on kernel 7.3 (Omarchy, arm64).
 
@@ -80,12 +80,26 @@ sudo ./packaging/install.sh
   kernel updates)
 - installs `/etc/modprobe.d/surface-ultra-camera.conf` and
   `/etc/modules-load.d/surface-ultra-camera.conf`
-- enables `sucamd.service`
+- enables `sucamd.service` (front) and `sucamd-ir.service` (IR)
 
 It is safe to run again after pulling updates. `sudo ./packaging/uninstall.sh`
 removes everything.
 
-Then just pick **"Surface Camera"** in your camera app.
+Then just pick **"Surface Camera"** in your camera app. The IR camera is **"Surface IR Camera"**.
+
+### About the IR camera
+
+- It gives a grey picture lit by the IR LED, also in the dark. Exposure is the sensor's own
+  auto exposure.
+- The front and IR cameras share the path to camsv (outmux1 -> camsv_b), so they cannot run
+  at the same time. Opening one while the other streams makes the driver return `EBUSY`;
+  `sucamd-ir` / `sucamd` retry every 3 s, so it starts once the first one is closed.
+- The raw device "Surface Laptop Ultra IR Camera" has V4L2 controls: `auto_exposure`
+  (auto by default), `exposure`, `analogue_gain` (in manual mode) and `led_mode` (IR LED,
+  `0` turns it off).
+- The 600x600 picture is the centre of the sensor (804x704), cropped where the Windows
+  driver crops it. No Windows capture of the IR camera exists, so the receive side (CSI
+  port 2) is derived from the front camera's capture ([how-it-works.md](docs/how-it-works.md#ir-camera)).
 
 ## Options
 

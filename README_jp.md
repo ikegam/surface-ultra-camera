@@ -18,7 +18,7 @@ MediaTek とは関係ありません。
 | 自動露出 / ホワイトバランス / ノイズ低減 / フリッカー対策 | **動作**(ソフトウェア処理、`sucamd`) |
 | プライバシー LED | アプリがカメラを使っている間だけ点灯 |
 | サスペンド / 復帰 | 動作 |
-| IR カメラ(ST VD55G1、Windows Hello) | 未対応 |
+| IR カメラ(ST VD55G1) | **動作**:**"Surface IR Camera"** として 640x480 の白黒、30 fps、IR LED 付き。フロントカメラと同時には使えない。顔認証(Windows Hello 相当)は対象外 |
 
 カーネル 7.3(Omarchy、arm64)で確認しています。
 
@@ -78,12 +78,25 @@ sudo ./packaging/install.sh
 - カーネルモジュールを DKMS に登録する(カーネル更新時に自動で再ビルドされる)
 - `/etc/modprobe.d/surface-ultra-camera.conf` と
   `/etc/modules-load.d/surface-ultra-camera.conf` を置く
-- `sucamd.service` を有効にする
+- `sucamd.service`(フロント)と `sucamd-ir.service`(IR)を有効にする
 
 更新を取り込んだあとに再実行しても大丈夫です。`sudo ./packaging/uninstall.sh` で
 全部取り除けます。
 
-あとはカメラアプリで **"Surface Camera"** を選ぶだけです。
+あとはカメラアプリで **"Surface Camera"** を選ぶだけです。IR カメラは **"Surface IR Camera"** です。
+
+### IR カメラについて
+
+- 暗い所でも IR LED で照らした白黒の映像になります。露出はセンサー内蔵の自動露出です。
+- フロントカメラと IR カメラは camsv までの経路(outmux1 → camsv_b)を共有しているので、
+  同時には使えません。片方が映っている間にもう片方を開くと、ドライバは `EBUSY` を返し、
+  `sucamd-ir` / `sucamd` は 3 秒ごとにやり直します。先に開いた方を閉じれば映ります。
+- 生のデバイス "Surface Laptop Ultra IR Camera" には V4L2 コントロールがあります:
+  `auto_exposure`(既定は自動)、`exposure`、`analogue_gain`(手動のとき)、
+  `led_mode`(IR LED、`0` で消灯)。
+- 600x600 の画像はセンサー(804x704)の中央を Windows のドライバと同じ位置で切り出したものです。
+  Windows の IR カメラの通信は採取していないので、受信側(CSI ポート 2)の設定はフロントカメラの
+  採取から導いたものです([how-it-works_jp.md](docs/how-it-works_jp.md#ir-カメラ))。
 
 ## オプション
 
