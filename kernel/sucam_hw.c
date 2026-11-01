@@ -18,8 +18,10 @@
 #include "ccu_replay.h"
 #include "golden_mmio.h"
 #include "golden_omux_all.h"
+#include "ir_tables.h"
 
 #define SENSOR_DEV	"i2c-OVTI02C1:00"
+#define IR_SENSOR_DEV	"i2c-SMO55F1:00"
 
 #define HFRP_BASE	0x31160000
 #define HFRP_SIZE	0x204
@@ -44,6 +46,7 @@
 #define CCU_FT_SENINF	4
 
 #define SENINF_MMIO	0x12a10000	/* rxanaA@0 dphy@0x2000 mac_top@0x4000 mac_csi@0x5000 */
+#define SENINF_PORT2	0x12a20000	/* same layout, CSI port 2 (IR camera) */
 #define OUTMUX_BASE	0x3a100000	/* outmux n @ +n*0x10000 */
 #define CAMSV_B		0x3a510000	/* the camsv instance Windows uses */
 #define CAMSV_SIZE	0x3000
@@ -149,12 +152,20 @@ static int ccu_send(struct sucam *cam, u32 ft, u32 cmd, u32 *buf, u32 len)
 	return status == cmd ? 0 : -EIO;
 }
 
+static const struct ccucmd *replay_table(struct sucam *cam, int *n)
+{
+	*n = cam->cfg->ir ? ARRAY_SIZE(ir_replay) : ARRAY_SIZE(ccu_replay);
+	return cam->cfg->ir ? ir_replay : ccu_replay;
+}
+
 static int ccu_replay_range(struct sucam *cam, int from, int to)
 {
-	int i, ret;
+	const struct ccucmd *t;
+	int i, n, ret;
 
+	t = replay_table(cam, &n);
 	for (i = from; i < to; i++) {
-		const struct ccucmd *c = &ccu_replay[i];
+		const struct ccucmd *c = &t[i];
 		u32 buf[16] = { 0 };
 
 		memcpy(buf, c->pl, c->len);
@@ -170,7 +181,7 @@ static int ccu_replay_range(struct sucam *cam, int from, int to)
 
 static int ccu_set_stream(struct sucam *cam, bool on)
 {
-	u32 b[2] = { 1, on };	/* MSG_SENINF_SET_STREAM {sensor_id 1, on} */
+	u32 b[2] = { cam->cfg->ir ? IR_SENSOR_ID : 1, on };	/* MSG_SENINF_SET_STREAM {sensor_id, on} */
 
 	return ccu_send(cam, CCU_FT_SENINF, 0x2, b, sizeof(b));
 }
@@ -200,6 +211,8 @@ int sucam_sensor_set(struct sucam *cam, u32 id, s32 val)
 {
 	int ret = 0;
 
+	if (cam->cfg->ir)
+		return sucam_vd_set(cam, id, val);
 	if (!cam->powered)
 		return 0;	/* applied at next stream start */
 	switch (id) {
@@ -227,6 +240,8 @@ static int sensor_power(struct sucam *cam, bool on)
 	u8 idh = 0, idl = 0;
 	int i;
 
+	if (cam->cfg->ir)
+		return sucam_vd_power(cam, on);
 	if (!on) {
 		gpiod_set_value_cansleep(cam->gpio[SUCAM_GPIO_RESET], 1);
 		gpiod_set_value_cansleep(cam->gpio[SUCAM_GPIO_PLED], 0);
@@ -257,6 +272,8 @@ static int sensor_stream(struct sucam *cam, bool on)
 {
 	int i, ret;
 
+	if (cam->cfg->ir)
+		return sucam_vd_stream(cam, on);
 	if (!on)
 		return ov_write(cam, 0x0100, 0x00);
 	for (i = 0; i < ARRAY_SIZE(ov02c10_base); i++) {
@@ -287,7 +304,7 @@ static int sensor_stream(struct sucam *cam, bool on)
  * (1, 7) must be 0 and the unused ones are parked at 3. outmux registers are
  * double-buffered (cfg_mode NORMAL): SW_CFG_DONE (+0x1c) latches them.
  */
-static void outmux_setup(void)
+static void outmux_setup(struct sucam *cam)
 {
 	static const u8 nonwaived[] = { 0, 1, 4, 6, 7, 9, 11, 13 };
 	void __iomem *oa = ioremap(OUTMUX_BASE, 0xe0000);
@@ -297,6 +314,9 @@ static void outmux_setup(void)
 		return;
 	for (k = 0; k < ARRAY_SIZE(g_omux_all); k++)
 		writel(g_omux_all[k].val, oa + g_omux_all[k].mux * 0x10000 + g_omux_all[k].off);
+	if (cam->cfg->ir)		/* outmux1 from async 2, 600x600 */
+		for (k = 0; k < ARRAY_SIZE(ir_omux); k++)
+			writel(ir_omux[k].val, oa + IR_OUTMUX * 0x10000 + ir_omux[k].off);
 	wmb();
 	for (k = 0; k < ARRAY_SIZE(nonwaived); k++)
 		writel(1, oa + nonwaived[k] * 0x10000 + 0x1c);
@@ -304,9 +324,17 @@ static void outmux_setup(void)
 	iounmap(oa);
 }
 
-static void phy_mac_setup(void)
+static void writes(void __iomem *base, const struct rw *t, int n)
 {
-	void __iomem *sn = ioremap(SENINF_MMIO, 0x8000);
+	int i;
+
+	for (i = 0; i < n; i++)
+		writel(t[i].val, base + t[i].off);
+}
+
+static void phy_mac_setup(struct sucam *cam)
+{
+	void __iomem *sn = ioremap(cam->cfg->ir ? SENINF_PORT2 : SENINF_MMIO, 0x8000);
 	void __iomem *dp, *mt, *mc;
 	int i;
 
@@ -320,6 +348,16 @@ static void phy_mac_setup(void)
 	udelay(10);
 	writel(0, mt + 0x00);
 	writel(0, dp + 0x08);
+	if (cam->cfg->ir) {		/* port 2, 1 lane (ir_tables.h) */
+		writes(dp, ir_dphy, ARRAY_SIZE(ir_dphy));
+		writes(mt, ir_mactop, ARRAY_SIZE(ir_mactop));
+		writes(mc, ir_maccsi, ARRAY_SIZE(ir_maccsi));
+		wmb();
+		writel(P2_CSI2_EN, mc + 0x00);
+		wmb();
+		iounmap(sn);
+		return;
+	}
 	for (i = 0; i < ARRAY_SIZE(g_dphy); i++)
 		writel(g_dphy[i].val, dp + g_dphy[i].off);
 	writel(0x00000001, dp + 0x184);
@@ -344,10 +382,12 @@ static void camsv_setup(struct sucam *cam, dma_addr_t addr)
 		writel(g_camsv1[i].val, sv + g_camsv1[i].off);
 	for (i = 0; i < ARRAY_SIZE(g_camsv1dma); i++)
 		writel(g_camsv1dma[i].val, sv + g_camsv1dma[i].off);
+	if (cam->cfg->ir)		/* grab size 600x600 */
+		writes(sv, ir_camsv_override, ARRAY_SIZE(ir_camsv_override));
 	/* per-frame DMA regs (Windows writes these via CQ into the inner bank) */
 	writel(lower_32_bits(addr), sv + SV_WDMA_ADDR_IMG2);
 	writel(upper_32_bits(addr), sv + SV_WDMA_ADDR_MSB_IMG2);
-	writel((SUCAM_STRIDE << 16) | 0x10, sv + SV_WDMA_BASIC_IMG2);
+	writel((cam->cfg->stride << 16) | 0x10, sv + SV_WDMA_BASIC_IMG2);
 	writel(FBC_EN, sv + SV_FBC0_TAG2);
 	writel(FBC_EN | FBC_RCNT_INC, sv + SV_FBC0_TAG2);	/* 1 buffer available */
 	wmb();
@@ -390,7 +430,7 @@ void sucam_hw_arm(struct sucam *cam, dma_addr_t addr)
 /* one-line hardware state, logged by the poll thread while no frames arrive */
 void sucam_hw_diag(struct sucam *cam)
 {
-	void __iomem *sn = ioremap(SENINF_MMIO + 0x5000, 0x100);
+	void __iomem *sn = ioremap((cam->cfg->ir ? SENINF_PORT2 : SENINF_MMIO) + 0x5000, 0x100);
 	void __iomem *om = ioremap(OUTMUX_BASE + 0x10000, 0x100);
 	void __iomem *sv = cam->sv;
 
@@ -438,20 +478,46 @@ static bool outmux1_flowing(void)
 }
 
 static int hw_start_once(struct sucam *cam, dma_addr_t first);
+static void hw_stop(struct sucam *cam);
 
 /*
  * The first stream after the CCU firmware boots never gets routed (mac decodes,
  * outmux stays idle); the same sequence works from the second time on. So
  * check that data reaches outmux1 and redo the bring-up once if it does not.
  */
+/*
+ * Both cameras end in outmux1 -> camsv_b and share the HFRP and CCU mailboxes:
+ * one stream at a time.
+ */
+static DEFINE_MUTEX(path_lock);
+static struct sucam *path_owner;
+
+static int hw_start_locked(struct sucam *cam, dma_addr_t first);
+
 int sucam_hw_start(struct sucam *cam, dma_addr_t first)
+{
+	int ret;
+
+	mutex_lock(&path_lock);
+	if (path_owner && path_owner != cam) {
+		mutex_unlock(&path_lock);
+		dev_info(cam->dev, "the other camera is streaming\n");
+		return -EBUSY;
+	}
+	ret = hw_start_locked(cam, first);
+	path_owner = ret ? NULL : cam;
+	mutex_unlock(&path_lock);
+	return ret;
+}
+
+static int hw_start_locked(struct sucam *cam, dma_addr_t first)
 {
 	int ret = hw_start_once(cam, first);
 
 	if (ret || outmux1_flowing())
 		return ret;
 	dev_info(cam->dev, "no data through outmux1, restarting the stream once\n");
-	sucam_hw_stop(cam);
+	hw_stop(cam);
 	ret = hw_start_once(cam, first);
 	if (!ret && !outmux1_flowing())
 		dev_warn(cam->dev, "still no data through outmux1\n");
@@ -467,7 +533,8 @@ static int hw_start_once(struct sucam *cam, dma_addr_t first)
 	static const u32 domains[] = { 0, 2, 5 };
 	static const u32 ccu_clks[] = { 0xa04, 0xa09, 0xa0a, 0x1a00, 0x1a01, 0x1a02, 0x1a04,
 					0x652 };
-	int i, ss, n = ARRAY_SIZE(ccu_replay), ret = 0;
+	const struct ccucmd *t;
+	int i, ss, n, ret = 0;
 
 	/*
 	 * Make sure the camera island is powered BEFORE touching any of its MMIO:
@@ -485,12 +552,14 @@ static int hw_start_once(struct sucam *cam, dma_addr_t first)
 		dev_err(cam->dev, "CCU firmware not running (load surface_ccu_boot go=1)\n");
 		return -EIO;
 	}
+	t = replay_table(cam, &n);
 	for (ss = 0; ss < n; ss++)
-		if (ccu_replay[ss].ft == CCU_FT_SENINF && ccu_replay[ss].cmd == 0x1)
+		if (t[ss].ft == CCU_FT_SENINF && t[ss].cmd == 0x1)
 			break;	/* MSG_SENINF_SET_SENSOR */
 
-	ret = hfrp_clocks(cam, (u32[]){ 0x813 }, 1, true);	/* CSI PHY0 */
-	ret = ret ?: hfrp_clock_rate(cam, 6, 312);
+	/* CSI PHY clock (0x813 + port) and its rate (id 6 + port) */
+	ret = hfrp_clocks(cam, (u32[]){ cam->cfg->ir ? 0x815 : 0x813 }, 1, true);
+	ret = ret ?: hfrp_clock_rate(cam, cam->cfg->ir ? 8 : 6, 312);
 	ret = ret ?: hfrp_clocks(cam, sv_clks, ARRAY_SIZE(sv_clks), true);
 	if (ret) {
 		dev_err(cam->dev, "HFRP clocks: %d\n", ret);
@@ -500,12 +569,18 @@ static int hw_start_once(struct sucam *cam, dma_addr_t first)
 	if (ret)
 		return ret;
 
-	outmux_setup();
+	outmux_setup(cam);
 	ret = ccu_replay_range(cam, 0, ss);	/* iomem, common reg, rxana, async */
+	if (!ret && cam->cfg->ir) {
+		u32 om = IR_OUTMUX;
+
+		/* outmux clock on before it is configured (the replay gated it) */
+		ret = ccu_send(cam, CCU_FT_SENINF, 0x83, &om, sizeof(om));
+	}
 	if (ret)
 		goto err_power;
-	phy_mac_setup();
-	outmux_setup();
+	phy_mac_setup(cam);
+	outmux_setup(cam);
 	camsv_setup(cam, first);
 	ret = sensor_stream(cam, true);		/* path must be live before SET_SENSOR */
 	if (ret)
@@ -526,12 +601,22 @@ err_power:
 	return ret;
 }
 
-void sucam_hw_stop(struct sucam *cam)
+static void hw_stop(struct sucam *cam)
 {
 	camsv_stop(cam);
 	ccu_set_stream(cam, false);
 	sensor_stream(cam, false);
 	sensor_power(cam, false);
+}
+
+void sucam_hw_stop(struct sucam *cam)
+{
+	mutex_lock(&path_lock);
+	if (path_owner == cam) {
+		hw_stop(cam);
+		path_owner = NULL;
+	}
+	mutex_unlock(&path_lock);
 }
 
 /* ---------- resources ---------- */
@@ -557,12 +642,24 @@ static const char * const sucam_gpio_names[SUCAM_GPIO_NUM] = {
 	[SUCAM_GPIO_PLED] = "pled",
 };
 
+/*
+ * \_SB.CAMI (IR): campower, avdd, reset, pled. No mclk (the sensor has its own
+ * oscillator); pled is the front camera's LED pin, which the front device holds.
+ */
+static const struct acpi_gpio_mapping sucam_ir_gpios[] = {
+	{ "campower-gpios", &campower_gpio, 1 },
+	{ "avdd-gpios", &avdd_gpio, 1 },
+	{ "reset-gpios", &reset_gpio, 1 },
+	{ }
+};
+
 int sucam_hw_init(struct sucam *cam)
 {
 	struct acpi_device *adev;
 	int i, ret;
 
-	cam->sensor_dev = bus_find_device_by_name(&i2c_bus_type, NULL, SENSOR_DEV);
+	cam->sensor_dev = bus_find_device_by_name(&i2c_bus_type, NULL,
+						  cam->cfg->ir ? IR_SENSOR_DEV : SENSOR_DEV);
 	if (!cam->sensor_dev)
 		return -EPROBE_DEFER;	/* i2c controller not probed yet (early boot) */
 	cam->sensor = i2c_verify_client(cam->sensor_dev);
@@ -571,10 +668,12 @@ int sucam_hw_init(struct sucam *cam)
 		ret = -ENODEV;
 		goto err_put;
 	}
-	ret = acpi_dev_add_driver_gpios(adev, sucam_gpios);
+	ret = acpi_dev_add_driver_gpios(adev, cam->cfg->ir ? sucam_ir_gpios : sucam_gpios);
 	if (ret)
 		goto err_put;
 	for (i = 0; i < SUCAM_GPIO_NUM; i++) {
+		if (cam->cfg->ir && (i == SUCAM_GPIO_MCLK || i == SUCAM_GPIO_PLED))
+			continue;	/* not used by the IR camera (NULL = no-op) */
 		/* logical 0 = off; reset is active-low so 1 = held in reset */
 		cam->gpio[i] = gpiod_get(cam->sensor_dev, sucam_gpio_names[i],
 					 i == SUCAM_GPIO_RESET ? GPIOD_OUT_HIGH : GPIOD_OUT_LOW);
@@ -600,7 +699,8 @@ err_map:
 	return ret;
 err_gpio:
 	while (--i >= 0)
-		gpiod_put(cam->gpio[i]);
+		if (cam->gpio[i])
+			gpiod_put(cam->gpio[i]);
 	acpi_dev_remove_driver_gpios(adev);
 err_put:
 	put_device(cam->sensor_dev);

@@ -5,8 +5,8 @@ set -uo pipefail
 [ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
 PKG=surface-ultra-camera
 
-systemctl disable --now sucamd 2>/dev/null
-rm -f /etc/systemd/system/sucamd.service /usr/local/bin/sucamd
+systemctl disable --now sucamd sucamd-ir 2>/dev/null
+rm -f /etc/systemd/system/sucamd.service /etc/systemd/system/sucamd-ir.service /usr/local/bin/sucamd
 systemctl daemon-reload
 rmmod surface_ultra_cam surface_ccu_boot 2>/dev/null
 for v in $(dkms status "$PKG" 2>/dev/null | sed -n "s#^$PKG/\([^,]*\),.*#\1#p" | sort -u); do

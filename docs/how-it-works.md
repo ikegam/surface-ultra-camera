@@ -178,3 +178,35 @@ periods.
 sucamd subscribes to v4l2loopback's client-usage event and runs the camera only
 while some application is reading (the LED is lit only then too). It stops 2
 seconds after the last reader leaves.
+
+## IR camera
+
+An ST VD55G1 (monochrome, global shutter, one lane) sits at ACPI `\_SB.CAMI` (`SMO55F1`), on
+I2C 0x10, with GPIOs campower 35 / avdd 104 / reset 101 (active-low). There is no MCLK GPIO:
+the sensor runs from its own 12 MHz oscillator.
+
+**Sensor.** After power-up it reaches READY_TO_BOOT; writing `EXT_CLOCK` (0x0220) = 12 MHz,
+the firmware patch 2.9 (the one in the mainline `vd55g1` driver) at 0x2000 and `BOOT = 2`
+brings it to SW_STBY. The mode is exactly the 112 register writes of the Windows sensor driver
+(`surfacemipicamsensor.sys`): 1086 Mbps, the centre 600x600 of 804x704, RAW10, and the IR LED
+strobed from sensor GPIO2. Windows alternates two contexts for face authentication; here a
+single context with twice the frame length (30 fps) is used, with the sensor's auto exposure.
+With settings of our own (600 Mbps and so on) SYSTEM_FSM dropped to 0xFF right after streaming
+started.
+
+**Receive path.** CSI port 2 (PHY2 0x12A20000) -> mac_csi2 -> async 2 -> outmux1 -> camsv_b.
+The CCU command sequence and the PHY/mac values come from the front camera's capture with the
+port number, rxana addresses and lane count replaced (`kernel/ir_tables.h`). The key is
+**`MIPI_SPLIT = 1`** in the async (set_async `0x89 {2, 1, 0, 1}`): PHY2 is a 4D1C port and a
+one-lane sensor counts as its A half. With 0, mac_csi2 put out 600x600 (`SIZE_CHK` RCV0 +0x448
+= 0x02580258) but nothing entered async 2, and the outmux's `SW_CFG_DONE` (+0x1c) stayed 1
+(the configuration never latched). outmux0 -> camsv_a did not work, so the IR camera uses the
+front camera's outmux1 -> camsv_b and the two cannot run together.
+
+**Useful for debugging.**
+
+- mac_csi `+0xd4` (last long packet: WC/VC/DT; 0x02ee002b for the IR camera), `+0xdc` (packet
+  counts), `+0x440/+0x448` (SIZE_CHK: write 0x002b0011 to CTRL0, read the received size in RCV0).
+- outmux `+0x1c` back at 0 means the configuration latched; `+0xac` is the measured tag size.
+- CCU `0x8a` (SET_TEST_MODEL, 26 words `{async, 0, lines, pixels, 0, 1, vc[10], dt[10]}`) runs
+  an async test pattern, which tests async -> outmux -> camsv without the sensor, PHY or mac.

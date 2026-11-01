@@ -174,3 +174,34 @@ camsv_b の SOF 割り込み(ISP1 の `_CRS` にある GSI `0x20D`。Windows と
 sucamd は v4l2loopback の client-usage イベントを購読していて、どれかの
 アプリが読んでいる間だけカメラを動かします(LED もその間だけ点灯)。最後の
 読み手がいなくなってから 2 秒後に停止します。
+
+## IR カメラ
+
+ST VD55G1(モノクロ、グローバルシャッター、1 レーン)が ACPI `\_SB.CAMI`(`SMO55F1`)にあり、
+I2C は 0x10、GPIO は campower 35 / avdd 104 / reset 101(負論理)。MCLK の GPIO は無く、センサーは
+専用の 12 MHz 発振器で動きます。
+
+**センサー。** 電源を入れると READY_TO_BOOT になり、`EXT_CLOCK`(0x0220)= 12 MHz を書いて
+ファームウェアパッチ 2.9(mainline の `vd55g1` ドライバと同じもの)を 0x2000 に書き、
+`BOOT = 2` で SW_STBY になります。モードは Windows のセンサードライバ(`surfacemipicamsensor.sys`)
+にある 112 個のレジスタ書き込みそのもので、1086 Mbps、804x704 の中央 600x600、RAW10、
+センサーの GPIO2 で IR LED をストロボ点灯します。Windows は顔認証のために 2 つのコンテキストを
+交互に使いますが、ここでは 1 つにしてフレーム長を 2 倍(30 fps)にし、自動露出をセンサーに任せます。
+自分で選んだ設定(600 Mbps など)ではストリーム開始直後に SYSTEM_FSM が 0xFF に落ちました。
+
+**受信。** CSI ポート 2(PHY2 0x12A20000)→ mac_csi2 → async 2 → outmux1 → camsv_b。
+CCU のコマンド列と PHY/mac の値は、フロントカメラの採取から port 番号、rxana のアドレス、
+レーン数を置き換えて作りました(`kernel/ir_tables.h`)。決め手は async の **`MIPI_SPLIT = 1`**
+(set_async `0x89 {2, 1, 0, 1}`)です。PHY2 は 4D1C のポートで、1 レーンのセンサーはその A 半分として
+扱われます。0 のままだと mac_csi2 は 600x600 を出している(`SIZE_CHK` RCV0 +0x448 = 0x02580258)のに
+async 2 には入らず、outmux の `SW_CFG_DONE`(+0x1c)が 1 のまま(設定が確定しない)でした。
+outmux0 → camsv_a は通らなかったので、フロントカメラと同じ outmux1 → camsv_b を使い、
+同時には使えないようにしています。
+
+**切り分けに使えるもの。**
+
+- mac_csi `+0xd4`(最後の長パケット: WC/VC/DT。IR は 0x02ee002b)、`+0xdc`(パケット数)、
+  `+0x440/+0x448`(SIZE_CHK。CTRL0 に 0x002b0011 を書くと RCV0 に受け取ったサイズ)。
+- outmux `+0x1c` が 0 に戻れば設定が確定している。`+0xac` は測ったタグのサイズ。
+- CCU の `0x8a`(SET_TEST_MODEL、26 ワード `{async, 0, lines, pixels, 0, 1, vc[10], dt[10]}`)で
+  async のテストパターンを流すと、センサー・PHY・mac 抜きで async → outmux → camsv を試せる。

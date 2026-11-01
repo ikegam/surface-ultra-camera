@@ -38,9 +38,9 @@ install -m644 "$TOP/packaging/modprobe.conf" /etc/modprobe.d/$PKG.conf
 install -m644 "$TOP/packaging/modules-load.conf" /etc/modules-load.d/$PKG.conf
 
 echo "== sucamd"
-systemctl stop sucamd 2>/dev/null || true
+systemctl stop sucamd sucamd-ir 2>/dev/null || true
 install -m755 "$BIN" /usr/local/bin/sucamd
-install -m644 "$TOP/packaging/sucamd.service" /etc/systemd/system/sucamd.service
+install -m644 "$TOP/packaging/sucamd.service" "$TOP/packaging/sucamd-ir.service" /etc/systemd/system/
 systemctl daemon-reload
 
 echo "== loading the installed drivers (no reboot needed)"
@@ -50,8 +50,11 @@ rmmod surface_ultra_cam 2>/dev/null || true
 rmmod surface_ccu_boot 2>/dev/null || true
 modprobe surface_ccu_boot
 modprobe surface_ultra_cam
-lsmod | grep -q '^v4l2loopback' || modprobe v4l2loopback
-systemctl enable --now sucamd
+# reload v4l2loopback so it has both endpoints (fails if another program holds it)
+rmmod v4l2loopback 2>/dev/null || true
+modprobe v4l2loopback
+systemctl enable --now sucamd sucamd-ir
 sleep 2
-systemctl --no-pager --lines=3 status sucamd || true
-echo "done: open any camera app and pick \"Surface Camera\""
+systemctl --no-pager --lines=3 status sucamd sucamd-ir || true
+echo "done: open any camera app and pick \"Surface Camera\" or \"Surface IR Camera\""
+echo "      (one at a time: both cameras share the capture path)"
