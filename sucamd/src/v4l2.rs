@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 //! Minimal V4L2 over libc: just the ioctls sucamd needs (arm64/x86_64 layouts).
 use anyhow::{Context, Result};
 use std::fs::{File, OpenOptions};

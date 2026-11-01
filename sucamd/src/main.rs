@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 //! sucamd: turns the Surface Laptop Ultra raw camera (surface_ultra_cam) into a
 //! normal webcam via v4l2loopback. The raw stream (and the privacy LED) only
 //! runs while some application is reading the loopback device.

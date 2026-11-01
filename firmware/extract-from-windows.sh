@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
 # Extract the NVIDIA N1X camera CCU firmware (nvCCU.img) from your own Windows install.
 #
 # The firmware is NVIDIA's property and is not redistributed here; every owner extracts it

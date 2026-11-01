@@ -8,6 +8,9 @@ can use it as is.
 This is an unofficial driver built through reverse engineering. It is not
 affiliated with Microsoft, NVIDIA or MediaTek.
 
+**Use it at your own risk.** It comes with no warranty. The driver programs the
+camera hardware directly through its registers, so a bug can hang the system.
+
 (Japanese: [README_jp.md](README_jp.md))
 
 ## Status

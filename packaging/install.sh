@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0
 # Install the Surface Laptop Ultra camera stack: DKMS kernel modules, module
 # configuration and the sucamd service. Safe to re-run (upgrades in place).
 #   sudo ./packaging/install.sh

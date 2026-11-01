@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0
 # Remove everything install.sh put in place (the firmware in /lib/firmware is left alone).
 #   sudo ./packaging/uninstall.sh
 set -uo pipefail

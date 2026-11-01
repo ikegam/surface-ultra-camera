@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * ccusnoop v3 - Surface Laptop Ultra (N1X) CCU mailbox snooper + full camera register dumper.
  *

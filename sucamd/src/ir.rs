@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 //! IR camera path: 600x600 MTK-packed 10-bit mono -> centre crop to the output aspect
 //! -> nearest-neighbour scale -> tone curve -> YUYV (grey). Exposure is the sensor's own AE.
 use rayon::prelude::*;

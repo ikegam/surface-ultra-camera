@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 //! Software ISP for the OV02C10 raw stream:
 //! unpack MTK RAW10 -> black level -> bilinear demosaic (GBRG) -> white balance
 //! -> scale to the output size -> tone curve -> YUV -> chroma blur + motion-
