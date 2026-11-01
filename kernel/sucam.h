@@ -11,6 +11,7 @@
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
+#include <linux/workqueue.h>
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
 #include <media/videobuf2-v4l2.h>
@@ -20,6 +21,9 @@
 #define SUCAM_STRIDE	2400			/* 1920 * 10 / 8, MTK packed RAW10 */
 #define SUCAM_SIZE	(SUCAM_STRIDE * SUCAM_H)
 #define SUCAM_FPS	30
+
+/* camsv_b interrupts in ISP1 _CRS: 0x20A = done/err, 0x20D = SOF (tag n at bit 2+4n) */
+#define SUCAM_SOF_GSI	0x20D
 
 /* MediaTek ISP packed 10-bit GBRG (little-endian bitstream), same fourcc the
  * downstream MediaTek ISP driver uses for V4L2_PIX_FMT_MTISP_SGBRG10 */
@@ -65,12 +69,16 @@ struct sucam {
 	struct gpio_desc *gpio[SUCAM_GPIO_NUM];
 	bool powered, streaming;
 
-	/* buffer flow (camsv FBC, polled) */
+	/* buffer flow (camsv FBC, driven by the camsv_b SOF interrupt) */
 	spinlock_t qlock;
 	struct list_head queued;	/* waiting to be armed */
 	struct sucam_buf *pending;	/* in the outer WDMA addr, latched at next SOF */
 	struct sucam_buf *writing;	/* latched by the last SOF, being written */
-	struct task_struct *poll;
+	int irq;			/* SOF interrupt, < 0 if unavailable */
+	bool irq_on;			/* requested for the current stream */
+	struct task_struct *poll;	/* fallback when there is no interrupt */
+	struct delayed_work watchdog;	/* logs hardware state while frames stall */
+	u32 watch_seq;
 	u8 last_wcnt;
 	u32 sequence;
 };

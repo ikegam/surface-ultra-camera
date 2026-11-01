@@ -6,8 +6,10 @@
  * single video node. The sensor (and its privacy LED) is powered only while
  * streaming. Requires surface_ccu_boot to have booted the CCU firmware.
  */
+#include <linux/acpi.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
+#include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <media/v4l2-event.h>
@@ -30,62 +32,90 @@ static dma_addr_t buf_addr(struct sucam_buf *b)
 	return vb2_dma_contig_plane_dma_addr(&b->vb.vb2_buf, 0);
 }
 
-/* ---------- frame completion (camsv FBC write count, polled) ---------- */
+/* ---------- frame completion (camsv FBC write count) ---------- */
+static bool poll;
+module_param(poll, bool, 0644);
+MODULE_PARM_DESC(poll, "poll the camsv every 1 ms instead of using its SOF interrupt");
+
+/*
+ * Two buffers in flight: at each SOF the outer address (pending) is latched
+ * and becomes the one being written, and we immediately program the next one,
+ * so it has a whole frame time to land. A frame completes when the FBC write
+ * count moves, which happens before the next SOF.
+ */
+static void sucam_frame_done(struct sucam *cam)
+{
+	struct sucam_buf *done;
+	unsigned long flags;
+	u8 w = sucam_hw_wcnt(cam);
+
+	if (w == cam->last_wcnt)
+		return;
+	cam->last_wcnt = w;
+	spin_lock_irqsave(&cam->qlock, flags);
+	done = cam->writing;
+	cam->writing = NULL;
+	spin_unlock_irqrestore(&cam->qlock, flags);
+	if (done) {
+		done->vb.vb2_buf.timestamp = ktime_get_ns();
+		done->vb.sequence = cam->sequence++;
+		done->vb.field = V4L2_FIELD_NONE;
+		vb2_buffer_done(&done->vb.vb2_buf, VB2_BUF_STATE_DONE);
+	}
+}
+
+static void sucam_frame_start(struct sucam *cam)
+{
+	struct sucam_buf *next;
+	unsigned long flags;
+
+	spin_lock_irqsave(&cam->qlock, flags);
+	if (cam->pending) {
+		cam->writing = cam->pending;
+		cam->pending = NULL;
+	}
+	next = list_first_entry_or_null(&cam->queued, struct sucam_buf, list);
+	if (next) {
+		list_del(&next->list);
+		cam->pending = next;
+		sucam_hw_arm(cam, buf_addr(next));
+	}
+	spin_unlock_irqrestore(&cam->qlock, flags);
+}
+
+/* only requested while streaming: the camsv is powered and clocked then */
+static irqreturn_t sucam_sof_irq(int irq, void *data)
+{
+	struct sucam *cam = data;
+
+	if (!sucam_hw_sof(cam))		/* read-to-clear; the line is shared */
+		return IRQ_NONE;
+	sucam_frame_done(cam);
+	sucam_frame_start(cam);
+	return IRQ_HANDLED;
+}
+
 static int sucam_poll_fn(void *data)
 {
 	struct sucam *cam = data;
-	unsigned long last = jiffies;
 
 	while (!kthread_should_stop()) {
-		u8 w = sucam_hw_wcnt(cam);
-
-		if (time_after(jiffies, last + HZ)) {	/* no frame for 1 s */
-			sucam_hw_diag(cam);
-			last = jiffies;
-		}
-		/*
-		 * Two buffers in flight: at each SOF the outer address (pending) is
-		 * latched and becomes the one being written, and we immediately
-		 * program the next one, so it has a whole frame time to land.
-		 * A frame completes when the FBC write count moves.
-		 */
-		if (w != cam->last_wcnt) {
-			struct sucam_buf *done;
-			unsigned long flags;
-
-			cam->last_wcnt = w;
-			last = jiffies;
-			spin_lock_irqsave(&cam->qlock, flags);
-			done = cam->writing;
-			cam->writing = NULL;
-			spin_unlock_irqrestore(&cam->qlock, flags);
-			if (done) {
-				done->vb.vb2_buf.timestamp = ktime_get_ns();
-				done->vb.sequence = cam->sequence++;
-				done->vb.field = V4L2_FIELD_NONE;
-				vb2_buffer_done(&done->vb.vb2_buf, VB2_BUF_STATE_DONE);
-			}
-		}
-		if (sucam_hw_sof(cam)) {
-			struct sucam_buf *next;
-			unsigned long flags;
-
-			spin_lock_irqsave(&cam->qlock, flags);
-			if (cam->pending) {
-				cam->writing = cam->pending;
-				cam->pending = NULL;
-			}
-			next = list_first_entry_or_null(&cam->queued, struct sucam_buf, list);
-			if (next) {
-				list_del(&next->list);
-				cam->pending = next;
-				sucam_hw_arm(cam, buf_addr(next));
-			}
-			spin_unlock_irqrestore(&cam->qlock, flags);
-		}
+		sucam_frame_done(cam);
+		if (sucam_hw_sof(cam))
+			sucam_frame_start(cam);
 		usleep_range(1000, 1500);
 	}
 	return 0;
+}
+
+static void sucam_watchdog(struct work_struct *work)
+{
+	struct sucam *cam = container_of(work, struct sucam, watchdog.work);
+
+	if (cam->sequence == cam->watch_seq)	/* no frame for 1 s */
+		sucam_hw_diag(cam);
+	cam->watch_seq = cam->sequence;
+	schedule_delayed_work(&cam->watchdog, HZ);
 }
 
 /* ---------- vb2 ---------- */
@@ -173,8 +203,8 @@ static int sucam_hw_run(struct sucam *cam)
 
 	/*
 	 * hw_start waits for data to reach outmux1, so the first buffer may
-	 * already hold a frame: hand it out and arm the next one, so the poll
-	 * thread starts in step with the hardware.
+	 * already hold a frame: hand it out and arm the next one, so the SOF
+	 * handler starts in step with the hardware.
 	 */
 	if (sucam_hw_wcnt(cam) != cam->last_wcnt) {
 		struct sucam_buf *next;
@@ -195,14 +225,25 @@ static int sucam_hw_run(struct sucam *cam)
 		first->vb.field = V4L2_FIELD_NONE;
 		vb2_buffer_done(&first->vb.vb2_buf, VB2_BUF_STATE_DONE);
 	}
-	cam->poll = kthread_run(sucam_poll_fn, cam, "sucam-poll");
-	if (IS_ERR(cam->poll)) {
-		ret = PTR_ERR(cam->poll);
-		cam->poll = NULL;
-		sucam_hw_stop(cam);
-		return ret;
+	cam->irq_on = false;
+	if (!poll && cam->irq >= 0) {
+		ret = request_irq(cam->irq, sucam_sof_irq, IRQF_SHARED, DRV_NAME, cam);
+		if (ret)
+			dev_warn(cam->dev, "SOF irq %d: %d, polling instead\n", cam->irq, ret);
+		cam->irq_on = !ret;
+	}
+	if (!cam->irq_on) {
+		cam->poll = kthread_run(sucam_poll_fn, cam, "sucam-poll");
+		if (IS_ERR(cam->poll)) {
+			ret = PTR_ERR(cam->poll);
+			cam->poll = NULL;
+			sucam_hw_stop(cam);
+			return ret;
+		}
 	}
 	cam->streaming = true;
+	cam->watch_seq = cam->sequence;
+	schedule_delayed_work(&cam->watchdog, HZ);
 	return 0;
 }
 
@@ -210,7 +251,12 @@ static void sucam_hw_halt(struct sucam *cam)
 {
 	if (!cam->streaming)
 		return;
-	kthread_stop(cam->poll);
+	cancel_delayed_work_sync(&cam->watchdog);
+	if (cam->irq_on)
+		free_irq(cam->irq, cam);
+	else
+		kthread_stop(cam->poll);
+	cam->irq_on = false;
 	cam->poll = NULL;
 	cam->streaming = false;
 	sucam_hw_stop(cam);
@@ -436,7 +482,17 @@ static int sucam_probe(struct platform_device *pdev)
 	mutex_init(&cam->lock);
 	spin_lock_init(&cam->qlock);
 	INIT_LIST_HEAD(&cam->queued);
+	INIT_DELAYED_WORK(&cam->watchdog, sucam_watchdog);
 	platform_set_drvdata(pdev, cam);
+
+	/*
+	 * camsv_b's SOF line, as listed in ISP1's _CRS. ISP1 has no driver, so
+	 * map the GSI ourselves (this returns its existing mapping).
+	 */
+	cam->irq = acpi_register_gsi(NULL, SUCAM_SOF_GSI, ACPI_LEVEL_SENSITIVE,
+				     ACPI_ACTIVE_HIGH);
+	if (cam->irq < 0)
+		dev_warn(cam->dev, "no SOF irq (%d), will poll\n", cam->irq);
 
 	ret = sucam_hw_init(cam);
 	if (ret)
