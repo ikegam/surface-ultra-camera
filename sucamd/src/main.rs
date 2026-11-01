@@ -1,6 +1,8 @@
 //! sucamd: turns the Surface Laptop Ultra raw camera (surface_ultra_cam) into a
 //! normal webcam via v4l2loopback. The raw stream (and the privacy LED) only
 //! runs while some application is reading the loopback device.
+//! `sucamd --ir` does the same for the IR camera (grey picture, IR LED on).
+mod ir;
 mod isp;
 mod v4l2;
 
@@ -11,6 +13,8 @@ use v4l2::{Capture, Dev, PixFormat};
 
 const RAW_NAME: &str = "Surface Laptop Ultra Camera";
 const LOOP_NAME: &str = "Surface Camera";
+const IR_RAW_NAME: &str = "Surface Laptop Ultra IR Camera";
+const IR_LOOP_NAME: &str = "Surface IR Camera";
 /// v4l2loopback: V4L2_EVENT_PRIVATE_START + 0x08E00000 + 1, payload { u32 count }
 const EVENT_CLIENT_USAGE: u32 = 0x0800_0000 + 0x08E0_0000 + 1;
 const IDLE_STOP: Duration = Duration::from_secs(2);
@@ -125,10 +129,10 @@ struct Loopback {
 }
 
 impl Loopback {
-    fn open(w: usize, h: usize) -> Result<Self> {
-        let path = find_dev(LOOP_NAME).with_context(|| {
-            format!("v4l2loopback device \"{LOOP_NAME}\" not found \
-                     (modprobe v4l2loopback exclusive_caps=1 card_label=\"{LOOP_NAME}\")")
+    fn open(name: &str, w: usize, h: usize) -> Result<Self> {
+        let path = find_dev(name).with_context(|| {
+            format!("v4l2loopback device \"{name}\" not found \
+                     (see packaging/modprobe.conf for the v4l2loopback options)")
         })?;
         let dev = Dev::open(&path)?;
         dev.set_format(v4l2::BUF_TYPE_OUTPUT, PixFormat {
@@ -239,6 +243,55 @@ fn run_session(raw: &Dev, lp: &Loopback, isp: &mut isp::Isp, ae: &mut Ae, out: &
     }
 }
 
+/// IR: no white balance or AE here (the sensor runs its own), just tone mapping.
+fn run_ir_session(raw: &Dev, lp: &Loopback, isp: &ir::IrIsp, out: &mut [u8]) -> Result<()> {
+    let cap = Capture::start(raw, 4)?;
+    eprintln!("sucamd: IR streaming");
+    let (mut clients, mut idle_since) = (1u32, None::<Instant>);
+    loop {
+        let i = cap.dequeue(2000)?;
+        isp.render_yuyv(cap.buf(i), out);
+        cap.queue(i)?;
+        lp.dev.write_frame(out)?;
+        if let Some(c) = lp.clients(0) {
+            clients = c;
+        }
+        if clients == 0 {
+            let since = *idle_since.get_or_insert_with(Instant::now);
+            if since.elapsed() > IDLE_STOP {
+                eprintln!("sucamd: no readers, IR camera off");
+                return Ok(());
+            }
+        } else {
+            idle_since = None;
+        }
+    }
+}
+
+fn main_ir(o: &Opts) -> Result<()> {
+    let raw_path = find_dev(IR_RAW_NAME).context("surface_ultra_cam IR video node not found")?;
+    let raw = Dev::open(&raw_path)?;
+    let lp = Loopback::open(IR_LOOP_NAME, o.w, o.h)?;
+    eprintln!("sucamd: {} -> {} ({}x{}, IR)", raw_path.display(), lp.path.display(), o.w, o.h);
+    let isp = ir::IrIsp::new(o.w, o.h);
+    let mut out = vec![0u8; isp.out_size()];
+    for px in out.chunks_exact_mut(2) {
+        px.copy_from_slice(&[16, 128]);
+    }
+    lp.dev.write_frame(&out)?;
+    loop {
+        if let Some(n) = lp.clients(1000) {
+            if n > 0 {
+                if let Err(e) = run_ir_session(&raw, &lp, &isp, &mut out) {
+                    // EBUSY while the front camera streams: they share the capture path
+                    eprintln!("sucamd: IR stream error: {e:#}; retrying in 3 s");
+                    std::thread::sleep(Duration::from_secs(3));
+                }
+            }
+        }
+    }
+}
+
 /// `sucamd test <raw> <out.yuyv> [opts]`: run the ISP on a saved frame (a few
 /// iterations so white balance and the temporal filter settle), report timing.
 fn test_file(src: &str, dst: &str, o: &Opts) -> Result<()> {
@@ -266,10 +319,18 @@ fn main() -> Result<()> {
     if args.len() >= 3 && args[0] == "test" {
         return test_file(&args[1], &args[2], &Opts::parse(&args[3..])?);
     }
-    let o = Opts::parse(&args)?;
+    let ir = args.iter().any(|a| a == "--ir");
+    let args: Vec<String> = args.into_iter().filter(|a| a != "--ir").collect();
+    let mut o = Opts::parse(&args)?;
+    if ir {
+        if !args.iter().any(|a| a == "--size") {
+            (o.w, o.h) = (640, 480);
+        }
+        return main_ir(&o);
+    }
     let raw_path = find_dev(RAW_NAME).context("surface_ultra_cam video node not found")?;
     let raw = Dev::open(&raw_path)?;
-    let lp = Loopback::open(o.w, o.h)?;
+    let lp = Loopback::open(LOOP_NAME, o.w, o.h)?;
     eprintln!("sucamd: {} -> {} ({}x{}, mains {:?}, denoise {})",
               raw_path.display(), lp.path.display(), o.w, o.h, o.mains, o.denoise);
 

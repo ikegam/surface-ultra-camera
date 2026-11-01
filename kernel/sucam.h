@@ -1,6 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * Surface Laptop Ultra front camera (OV02C10 -> MediaTek ISP8 seninf -> camsv).
+ * Surface Laptop Ultra cameras (MediaTek ISP8 seninf -> camsv):
+ *   front: OV02C10, CSI port 0, 2 lanes
+ *   IR:    VD55G1,  CSI port 2, 1 lane
+ * Both use outmux1 -> camsv_b, so only one of them can stream at a time.
  */
 #ifndef SUCAM_DRV_H
 #define SUCAM_DRV_H
@@ -45,6 +48,27 @@
 #define SUCAM_DGAIN_MAX		0x3fff
 #define SUCAM_DGAIN_DEF		0x400
 
+/* IR camera: 600x600 mono RAW10 (Windows' crop of the 804x704 sensor), MTK packed */
+#define SUCAM_IR_W		600
+#define SUCAM_IR_H		600
+#define SUCAM_IR_STRIDE		752		/* 600 * 10 / 8 = 750, 16-byte aligned */
+#define SUCAM_IR_FOURCC		v4l2_fourcc('M', 'Y', '1', '0')	/* MTK packed Y10 */
+#define SUCAM_IR_FRAME_LENGTH	4010		/* lines: 30 fps at 1086 Mbps */
+#define SUCAM_IR_EXP_MAX	(SUCAM_IR_FRAME_LENGTH - 64)
+#define SUCAM_IR_EXP_DEF	1500
+#define SUCAM_IR_AGAIN_MAX	28		/* gain = 32 / (32 - val) */
+#define SUCAM_IR_AGAIN_DEF	16
+
+struct sucam_cfg {
+	bool ir;
+	const char *card;		/* V4L2 card name */
+	const char *input;
+	const char *fmt_desc;
+	u32 fourcc, width, height, stride;
+};
+
+extern const struct sucam_cfg sucam_front_cfg, sucam_ir_cfg;
+
 enum { SUCAM_GPIO_CAMPOWER, SUCAM_GPIO_AVDD, SUCAM_GPIO_MCLK, SUCAM_GPIO_RESET,
        SUCAM_GPIO_PLED, SUCAM_GPIO_NUM };
 
@@ -55,6 +79,7 @@ struct sucam_buf {
 
 struct sucam {
 	struct device *dev;
+	const struct sucam_cfg *cfg;
 	struct v4l2_device v4l2_dev;
 	struct video_device vdev;
 	struct vb2_queue queue;
@@ -92,5 +117,10 @@ u8 sucam_hw_wcnt(struct sucam *cam);
 bool sucam_hw_sof(struct sucam *cam);
 void sucam_hw_diag(struct sucam *cam);
 int sucam_sensor_set(struct sucam *cam, u32 id, s32 val);
+
+/* sucam_vd55g1.c */
+int sucam_vd_power(struct sucam *cam, bool on);
+int sucam_vd_stream(struct sucam *cam, bool on);
+int sucam_vd_set(struct sucam *cam, u32 id, s32 val);
 
 #endif

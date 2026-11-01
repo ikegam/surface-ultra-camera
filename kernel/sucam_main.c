@@ -20,7 +20,29 @@
 
 #define DRV_NAME	"surface-ultra-cam"
 
-static struct platform_device *sucam_pdev;
+const struct sucam_cfg sucam_front_cfg = {
+	.card = "Surface Laptop Ultra Camera",
+	.input = "Front camera",
+	.fmt_desc = "MTK packed 10-bit GBRG",
+	.fourcc = SUCAM_FOURCC,
+	.width = SUCAM_W, .height = SUCAM_H, .stride = SUCAM_STRIDE,
+};
+
+const struct sucam_cfg sucam_ir_cfg = {
+	.ir = true,
+	.card = "Surface Laptop Ultra IR Camera",
+	.input = "IR camera",
+	.fmt_desc = "MTK packed 10-bit mono",
+	.fourcc = SUCAM_IR_FOURCC,
+	.width = SUCAM_IR_W, .height = SUCAM_IR_H, .stride = SUCAM_IR_STRIDE,
+};
+
+static struct platform_device *sucam_pdev[2];
+
+static u32 frame_size(const struct sucam *cam)
+{
+	return cam->cfg->stride * cam->cfg->height;
+}
 
 static inline struct sucam_buf *to_sucam_buf(struct vb2_v4l2_buffer *vb)
 {
@@ -122,18 +144,22 @@ static void sucam_watchdog(struct work_struct *work)
 static int sucam_queue_setup(struct vb2_queue *q, unsigned int *nbuf, unsigned int *nplanes,
 			     unsigned int sizes[], struct device *alloc_devs[])
 {
+	struct sucam *cam = vb2_get_drv_priv(q);
+
 	if (*nplanes)
-		return sizes[0] < SUCAM_SIZE ? -EINVAL : 0;
+		return sizes[0] < frame_size(cam) ? -EINVAL : 0;
 	*nplanes = 1;
-	sizes[0] = SUCAM_SIZE;
+	sizes[0] = frame_size(cam);
 	return 0;
 }
 
 static int sucam_buf_prepare(struct vb2_buffer *vb)
 {
-	if (vb2_plane_size(vb, 0) < SUCAM_SIZE)
+	struct sucam *cam = vb2_get_drv_priv(vb->vb2_queue);
+
+	if (vb2_plane_size(vb, 0) < frame_size(cam))
 		return -EINVAL;
-	vb2_set_plane_payload(vb, 0, SUCAM_SIZE);
+	vb2_set_plane_payload(vb, 0, frame_size(cam));
 	return 0;
 }
 
@@ -303,14 +329,14 @@ static const struct v4l2_ctrl_ops sucam_ctrl_ops = {
 };
 
 /* ---------- ioctls ---------- */
-static void sucam_fill_fmt(struct v4l2_pix_format *pix)
+static void sucam_fill_fmt(const struct sucam *cam, struct v4l2_pix_format *pix)
 {
-	pix->width = SUCAM_W;
-	pix->height = SUCAM_H;
-	pix->pixelformat = SUCAM_FOURCC;
+	pix->width = cam->cfg->width;
+	pix->height = cam->cfg->height;
+	pix->pixelformat = cam->cfg->fourcc;
 	pix->field = V4L2_FIELD_NONE;
-	pix->bytesperline = SUCAM_STRIDE;
-	pix->sizeimage = SUCAM_SIZE;
+	pix->bytesperline = cam->cfg->stride;
+	pix->sizeimage = frame_size(cam);
 	pix->colorspace = V4L2_COLORSPACE_RAW;
 	pix->xfer_func = V4L2_XFER_FUNC_NONE;
 	pix->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
@@ -320,23 +346,27 @@ static void sucam_fill_fmt(struct v4l2_pix_format *pix)
 static int sucam_querycap(struct file *file, void *fh, struct v4l2_capability *cap)
 {
 	strscpy(cap->driver, DRV_NAME, sizeof(cap->driver));
-	strscpy(cap->card, "Surface Laptop Ultra Camera", sizeof(cap->card));
+	struct sucam *cam = video_drvdata(file);
+
+	strscpy(cap->card, cam->cfg->card, sizeof(cap->card));
 	strscpy(cap->bus_info, "platform:" DRV_NAME, sizeof(cap->bus_info));
 	return 0;
 }
 
 static int sucam_enum_fmt(struct file *file, void *fh, struct v4l2_fmtdesc *f)
 {
+	struct sucam *cam = video_drvdata(file);
+
 	if (f->index)
 		return -EINVAL;
-	f->pixelformat = SUCAM_FOURCC;
-	strscpy(f->description, "MTK packed 10-bit GBRG", sizeof(f->description));
+	f->pixelformat = cam->cfg->fourcc;
+	strscpy(f->description, cam->cfg->fmt_desc, sizeof(f->description));
 	return 0;
 }
 
 static int sucam_fmt(struct file *file, void *fh, struct v4l2_format *f)
 {
-	sucam_fill_fmt(&f->fmt.pix);
+	sucam_fill_fmt(video_drvdata(file), &f->fmt.pix);
 	return 0;
 }
 
@@ -346,25 +376,29 @@ static int sucam_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
 
 	if (vb2_is_busy(&cam->queue))
 		return -EBUSY;
-	sucam_fill_fmt(&f->fmt.pix);
+	sucam_fill_fmt(cam, &f->fmt.pix);
 	return 0;
 }
 
 static int sucam_enum_framesizes(struct file *file, void *fh, struct v4l2_frmsizeenum *fs)
 {
-	if (fs->index || fs->pixel_format != SUCAM_FOURCC)
+	struct sucam *cam = video_drvdata(file);
+
+	if (fs->index || fs->pixel_format != cam->cfg->fourcc)
 		return -EINVAL;
 	fs->type = V4L2_FRMSIZE_TYPE_DISCRETE;
-	fs->discrete.width = SUCAM_W;
-	fs->discrete.height = SUCAM_H;
+	fs->discrete.width = cam->cfg->width;
+	fs->discrete.height = cam->cfg->height;
 	return 0;
 }
 
 static int sucam_enum_frameintervals(struct file *file, void *fh,
 				     struct v4l2_frmivalenum *fi)
 {
-	if (fi->index || fi->pixel_format != SUCAM_FOURCC ||
-	    fi->width != SUCAM_W || fi->height != SUCAM_H)
+	struct sucam *cam = video_drvdata(file);
+
+	if (fi->index || fi->pixel_format != cam->cfg->fourcc ||
+	    fi->width != cam->cfg->width || fi->height != cam->cfg->height)
 		return -EINVAL;
 	fi->type = V4L2_FRMIVAL_TYPE_DISCRETE;
 	fi->discrete.numerator = 1;
@@ -389,7 +423,7 @@ static int sucam_enum_input(struct file *file, void *fh, struct v4l2_input *in)
 	if (in->index)
 		return -EINVAL;
 	in->type = V4L2_INPUT_TYPE_CAMERA;
-	strscpy(in->name, "Front camera", sizeof(in->name));
+	strscpy(in->name, ((struct sucam *)video_drvdata(file))->cfg->input, sizeof(in->name));
 	return 0;
 }
 
@@ -479,6 +513,7 @@ static int sucam_probe(struct platform_device *pdev)
 	if (!cam)
 		return -ENOMEM;
 	cam->dev = &pdev->dev;
+	cam->cfg = dev_get_platdata(&pdev->dev);
 	mutex_init(&cam->lock);
 	spin_lock_init(&cam->qlock);
 	INIT_LIST_HEAD(&cam->queued);
@@ -502,13 +537,25 @@ static int sucam_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_hw;
 
-	v4l2_ctrl_handler_init(&cam->ctrls, 3);
-	cam->exposure = v4l2_ctrl_new_std(&cam->ctrls, &sucam_ctrl_ops, V4L2_CID_EXPOSURE,
-					  SUCAM_EXP_MIN, SUCAM_EXP_MAX, 1, SUCAM_EXP_DEF);
-	cam->again = v4l2_ctrl_new_std(&cam->ctrls, &sucam_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
-				       SUCAM_AGAIN_MIN, SUCAM_AGAIN_MAX, 1, SUCAM_AGAIN_DEF);
-	cam->dgain = v4l2_ctrl_new_std(&cam->ctrls, &sucam_ctrl_ops, V4L2_CID_DIGITAL_GAIN,
-				       SUCAM_DGAIN_MIN, SUCAM_DGAIN_MAX, 1, SUCAM_DGAIN_DEF);
+	v4l2_ctrl_handler_init(&cam->ctrls, 4);
+	if (cam->cfg->ir) {
+		/* the sensor's own AE by default; IR LED strobed with the exposure */
+		v4l2_ctrl_new_std_menu(&cam->ctrls, &sucam_ctrl_ops, V4L2_CID_EXPOSURE_AUTO,
+				       V4L2_EXPOSURE_MANUAL, 0, V4L2_EXPOSURE_AUTO);
+		cam->exposure = v4l2_ctrl_new_std(&cam->ctrls, &sucam_ctrl_ops, V4L2_CID_EXPOSURE,
+						  1, SUCAM_IR_EXP_MAX, 1, SUCAM_IR_EXP_DEF);
+		cam->again = v4l2_ctrl_new_std(&cam->ctrls, &sucam_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
+					       0, SUCAM_IR_AGAIN_MAX, 1, SUCAM_IR_AGAIN_DEF);
+		v4l2_ctrl_new_std_menu(&cam->ctrls, &sucam_ctrl_ops, V4L2_CID_FLASH_LED_MODE,
+				       V4L2_FLASH_LED_MODE_FLASH, ~0x3, V4L2_FLASH_LED_MODE_FLASH);
+	} else {
+		cam->exposure = v4l2_ctrl_new_std(&cam->ctrls, &sucam_ctrl_ops, V4L2_CID_EXPOSURE,
+						  SUCAM_EXP_MIN, SUCAM_EXP_MAX, 1, SUCAM_EXP_DEF);
+		cam->again = v4l2_ctrl_new_std(&cam->ctrls, &sucam_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
+					       SUCAM_AGAIN_MIN, SUCAM_AGAIN_MAX, 1, SUCAM_AGAIN_DEF);
+		cam->dgain = v4l2_ctrl_new_std(&cam->ctrls, &sucam_ctrl_ops, V4L2_CID_DIGITAL_GAIN,
+					       SUCAM_DGAIN_MIN, SUCAM_DGAIN_MAX, 1, SUCAM_DGAIN_DEF);
+	}
 	if (cam->ctrls.error) {
 		ret = cam->ctrls.error;
 		goto err_ctrl;
@@ -530,7 +577,7 @@ static int sucam_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_ctrl;
 
-	strscpy(cam->vdev.name, "Surface Laptop Ultra Camera", sizeof(cam->vdev.name));
+	strscpy(cam->vdev.name, cam->cfg->card, sizeof(cam->vdev.name));
 	cam->vdev.v4l2_dev = &cam->v4l2_dev;
 	cam->vdev.fops = &sucam_fops;
 	cam->vdev.ioctl_ops = &sucam_ioctl_ops;
@@ -544,8 +591,9 @@ static int sucam_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_ctrl;
 
-	dev_info(cam->dev, "%s registered (%ux%u MTK-packed GBRG10 @%u fps)\n",
-		 video_device_node_name(&cam->vdev), SUCAM_W, SUCAM_H, SUCAM_FPS);
+	dev_info(cam->dev, "%s registered: %s, %ux%u %s @%u fps\n",
+		 video_device_node_name(&cam->vdev), cam->cfg->card, cam->cfg->width,
+		 cam->cfg->height, cam->cfg->fmt_desc, SUCAM_FPS);
 	return 0;
 
 err_ctrl:
@@ -577,27 +625,43 @@ static struct platform_driver sucam_driver = {
 
 static int __init sucam_init(void)
 {
-	struct platform_device_info info = {
-		.name = DRV_NAME,
-		.id = PLATFORM_DEVID_NONE,
-		.dma_mask = DMA_BIT_MASK(32),	/* camsv sits behind an identity SMMU */
-	};
-	int ret;
+	static const struct sucam_cfg *cfgs[] = { &sucam_front_cfg, &sucam_ir_cfg };
+	int i, ret;
 
 	ret = platform_driver_register(&sucam_driver);
 	if (ret)
 		return ret;
-	sucam_pdev = platform_device_register_full(&info);
-	if (IS_ERR(sucam_pdev)) {
-		platform_driver_unregister(&sucam_driver);
-		return PTR_ERR(sucam_pdev);
+	for (i = 0; i < ARRAY_SIZE(cfgs); i++) {
+		struct platform_device_info info = {
+			.name = DRV_NAME,
+			.id = i,
+			.data = cfgs[i],		/* copied into platform_data */
+			.size_data = sizeof(*cfgs[i]),
+			.dma_mask = DMA_BIT_MASK(32),	/* camsv sits behind an identity SMMU */
+		};
+
+		sucam_pdev[i] = platform_device_register_full(&info);
+		if (IS_ERR(sucam_pdev[i])) {
+			ret = PTR_ERR(sucam_pdev[i]);
+			sucam_pdev[i] = NULL;
+			goto err;
+		}
 	}
 	return 0;
+err:
+	while (--i >= 0)
+		platform_device_unregister(sucam_pdev[i]);
+	platform_driver_unregister(&sucam_driver);
+	return ret;
 }
 
 static void __exit sucam_exit(void)
 {
-	platform_device_unregister(sucam_pdev);
+	int i;
+
+	for (i = ARRAY_SIZE(sucam_pdev) - 1; i >= 0; i--)
+		if (sucam_pdev[i])
+			platform_device_unregister(sucam_pdev[i]);
 	platform_driver_unregister(&sucam_driver);
 }
 
