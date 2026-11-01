@@ -106,6 +106,7 @@ struct sucam {
 	u32 watch_seq;
 	u8 last_wcnt;
 	u32 sequence;
+	u32 dropped;		/* frames lost at SOF (buffer requeued) */
 };
 
 int sucam_hw_init(struct sucam *cam);

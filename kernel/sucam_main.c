@@ -93,6 +93,16 @@ static void sucam_frame_start(struct sucam *cam)
 
 	spin_lock_irqsave(&cam->qlock, flags);
 	if (cam->pending) {
+		/*
+		 * The write count did not move since the last SOF, so the frame
+		 * that went to `writing` was dropped. Put that buffer back in the
+		 * queue instead of losing track of it (vb2 would then warn at
+		 * STREAMOFF that it is still active).
+		 */
+		if (cam->writing) {
+			list_add_tail(&cam->writing->list, &cam->queued);
+			cam->dropped++;
+		}
 		cam->writing = cam->pending;
 		cam->pending = NULL;
 	}
@@ -294,6 +304,7 @@ static int sucam_start_streaming(struct vb2_queue *q, unsigned int count)
 	int ret;
 
 	cam->sequence = 0;
+	cam->dropped = 0;
 	ret = sucam_hw_run(cam);
 	if (ret)
 		sucam_return_all(cam, VB2_BUF_STATE_QUEUED);
@@ -306,6 +317,9 @@ static void sucam_stop_streaming(struct vb2_queue *q)
 
 	sucam_hw_halt(cam);
 	sucam_return_all(cam, VB2_BUF_STATE_ERROR);
+	if (cam->dropped)
+		dev_info(cam->dev, "stream stopped: %u frames, %u dropped\n",
+			 cam->sequence, cam->dropped);
 }
 
 static const struct vb2_ops sucam_vb2_ops = {
