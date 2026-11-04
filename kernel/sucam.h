@@ -76,7 +76,7 @@
  * The IR image is lit by the illuminator, which the sensor strobes for the
  * exposure time; its driver stops the pulse somewhere between 2800 and 3300
  * lines (black frames). The sensor's own AE runs the exposure up to the frame
- * length, so default to a fixed exposure in the lit range, without gain.
+ * length, so default to a fixed exposure in the lit range.
  */
 #define SUCAM_IR_EXP_MAX	2500
 #define SUCAM_IR_EXP_DEF	2000

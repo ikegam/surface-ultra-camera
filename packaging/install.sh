@@ -3,7 +3,6 @@
 # Install the Surface Laptop Ultra camera support from this checkout: DKMS
 # kernel modules, their configuration, and the libcamera / WirePlumber / session
 # files that let PipeWire offer both cameras. Safe to re-run (upgrades in place).
-# A distribution package installs the same files (Omarchy: surface-ultra-camera).
 #   sudo ./packaging/install.sh
 set -euo pipefail
 [ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }

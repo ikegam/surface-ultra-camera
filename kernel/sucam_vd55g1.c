@@ -5,8 +5,8 @@
  * Power-up follows drivers/media/i2c/vd55g1.c (wait READY_TO_BOOT, EXT_CLOCK, firmware
  * patch 2.9, boot to SW_STBY). The mode is the register list of the Windows sensor driver
  * (12 MHz, 1086 Mbps on one lane, 600x600 RAW10, IR LED strobed from sensor GPIO2), changed
- * to a single context (Windows alternates two, for face authentication) at 30 fps, with the
- * sensor's own auto exposure.
+ * to a single context (Windows alternates two, for face authentication) at 30 fps, with a
+ * fixed exposure in the IR LED's range by default (sucam.h).
  */
 #include <linux/delay.h>
 #include <linux/i2c.h>
