@@ -143,41 +143,62 @@ instead of overwriting a buffer the application is holding.
 
 ## Raw format
 
-1920x1080 (camsv crops it from the sensor's 1928x1092), 10-bit Bayer **GBRG**.
-The packing is the MediaTek one: a little-endian bitstream in which pixel *k*
-of each 5-byte group occupies bits `[10k, 10k+10)`. 2400 bytes per line, black
-level 64. The V4L2 fourcc is `MBGA`, the same value MediaTek's downstream ISP
-driver uses for `V4L2_PIX_FMT_MTISP_SGBRG10`.
+1920x1080 (camsv crops it from the sensor's 1928x1092), 10-bit Bayer **GBRG**,
+written unpacked into 16 bits per pixel (little-endian, upper 6 bits zero).
+That is V4L2 `SGBRG10` (fourcc `GB10`), 3840 bytes per line, black level 64. A
+frame is 4147200 bytes, just under the largest contiguous DMA buffer this
+machine can allocate (4 MiB, no CMA).
 
-Controls: `exposure` (lines, 4..1454), `analogue_gain` (0x10..0xf8, gain x16),
-`digital_gain` (0x400..0x3fff, gain x1024).
+Windows uses 10 bits packed the MediaTek way (2400 bytes per line), which
+libcamera's software ISP cannot read. A sweep found that bit 6 of camsv's
+`FORMAT_TAG2` (+0x594) gives the unpacked form
+([camsv-output-format.md](camsv-output-format.md)). No setting for CSI-2
+packing (`SGBRG10P`) has been found.
 
-## sucamd
+## Media graph
 
-`sucamd` reads the raw node and writes YUYV to a v4l2loopback device. Each
-frame goes through:
+So that libcamera's simple pipeline can handle them, each camera gets a media
+graph:
 
-1. unpacking and black-level correction
-2. bilinear demosaicing
-3. gray-world white balance
-4. scaling to the output size
-5. gamma (with a mild S-curve)
-6. conversion to BT.601 (with slightly stronger saturation)
-7. a 3x3 blur on the chroma and a motion-adaptive temporal filter (the
-   threshold follows the sensor gain)
+```
+"ov02c10 14-0036" (sensor subdev) -> "surface-ultra-seninf" (subdev) -> video node
+"vd55g1 18-0010"  (sensor subdev) -> "surface-ultra-seninf" (subdev) -> video node
+```
 
-The whole pipeline is spread over all cores with rayon and takes about 3 ms at
-720p.
+The sensors and seninf are actually programmed by this driver (`sucam_hw.c`),
+so the subdevs only describe each camera's one fixed mode and carry the sensor
+controls. The stream starts at the video node's STREAMON.
 
-Auto exposure adjusts exposure (up to one frame), then analogue gain, then
-digital gain, so that the mean green level is 180 (out of 959). When flicker is
-detected (energy in the row means at the period of 100 Hz or 120 Hz banding,
-about 438 or 365 lines), the exposure is kept a whole number of flicker
-periods.
+Controls on the front camera's sensor subdev: `exposure` (lines, 4..1454),
+`analogue_gain` (0x10..0xf8, gain x16), `digital_gain` (0x400..0x3fff, gain
+x1024), `vertical_blanking`, plus `horizontal_blanking` / `pixel_rate`
+(read-only, for libcamera's frame-time calculation) and `camera_orientation`.
+The sensor is programmed in lines only, so `pixel_rate` is chosen, with a
+2280-pixel line, to match the measured 30 fps (VTS 1462).
 
-sucamd subscribes to v4l2loopback's client-usage event and runs the camera only
-while some application is reading (the LED is lit only then too). It stops 2
-seconds after the last reader leaves.
+## libcamera
+
+- **Pipeline.** The simple pipeline picks devices by the media device's driver
+  name. This driver's name is not registered yet, so the module parameter
+  `mdev_name=mtk-seninf` makes it pose as MediaTek's seninf (which is what it
+  drives). libcamera lists `mtk-seninf` without the software ISP, so
+  `libcamera/configuration.yaml` turns it on.
+- **Software ISP.** It demosaics, white-balances, auto-exposes and
+  colour-corrects the front camera's raw Bayer into an image, in about a third
+  of a CPU core at 1080p30. The GPU version does not work on the NVIDIA
+  driver's EGL (`glFramebufferTexture2D` fails with 0x8CD6, no frames), so
+  `LIBCAMERA_SOFTISP_MODE=cpu` selects the CPU one.
+- **Tuning file.** `libcamera/ipa/simple/ov02c10.yaml`: black level 64 (4096 on
+  libcamera's 16-bit scale) and a colour matrix that boosts saturation 1.6x
+  (chosen by eye, not measured from a chart).
+- **IR camera.** The software ISP has no mono path, so the driver writes 8-bit
+  grey (`GREY`) and libcamera passes it through.
+- **PipeWire.** libcamera reports both cameras as front-facing, so WirePlumber
+  names both "Built-in Front Camera". The configuration in `wireplumber/`
+  renames them "Surface Front Camera" and "Surface IR Camera".
+
+The stream runs, and the sensor is powered, only while some application uses
+the camera (the privacy LED is lit only then too).
 
 ## IR camera
 
@@ -190,7 +211,7 @@ the firmware patch 2.9 (the one in the mainline `vd55g1` driver) at 0x2000 and `
 brings it to SW_STBY. The mode is exactly the 112 register writes of the Windows sensor driver
 (`surfacemipicamsensor.sys`): 1086 Mbps, the centre 600x600 of 804x704, RAW10, and the IR LED
 strobed from sensor GPIO2. Windows alternates two contexts for face authentication; here a
-single context with twice the frame length (30 fps) is used, with the sensor's auto exposure.
+single context with twice the frame length (30 fps) is used.
 With settings of our own (600 Mbps and so on) SYSTEM_FSM dropped to 0xFF right after streaming
 started.
 
@@ -202,6 +223,20 @@ one-lane sensor counts as its A half. With 0, mac_csi2 put out 600x600 (`SIZE_CH
 = 0x02580258) but nothing entered async 2, and the outmux's `SW_CFG_DONE` (+0x1c) stayed 1
 (the configuration never latched). outmux0 -> camsv_a did not work, so the IR camera uses the
 front camera's outmux1 -> camsv_b and the two cannot run together.
+
+**Output.** camsv writes the centre 592 of the 600 columns (4 dropped on each side) as 8-bit
+grey. Lines are then 16-byte aligned and need no padding (with padding, ffmpeg's V4L2 input
+drops every frame as the wrong size).
+
+**Exposure and the IR LED.** Only what the IR LED lights shows up (room lighting has almost no
+IR; with the LED off the picture stays at the black level at any exposure). The sensor strobes
+the LED for the exposure time, but the LED driver cuts long pulses. At gain 0, the brightness
+above black was +4 at 124 lines, +20 at 500, +39 at 1000 and +77 at 2000; the LED was still lit
+at about 2800, and from 3000-3300 on the picture was black. The sensor's own auto exposure
+runs the exposure up to nearly the frame length (about 3950 lines), which gives the LED off
+and only the gain up: a dark, noisy picture. So the default is manual exposure at 2000 lines,
+2x analogue gain, with the exposure capped at 2500 lines. The privacy LED (pin 43, which ACPI
+also lists in CAMI's `_CRS`) is lit while the IR camera runs too.
 
 **Useful for debugging.**
 

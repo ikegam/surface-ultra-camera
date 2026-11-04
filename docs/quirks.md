@@ -75,6 +75,10 @@ ends up fighting over the GPIOs.
 - Do not write the FBC reset bit when starting a stream; frames stop arriving.
 - `SOF_STATUS` and `DONE_STATUS` clear on read, so diagnostic reads must not
   touch them.
-- Through v4l2loopback, `v4l2-ctl` shows a low fps at first, because the first
-  buffer it receives is the placeholder frame sucamd wrote at startup, with an
-  old timestamp. The real rate is 30 fps.
+- Setting bit 21 of camsv's `FORMAT_TAG2` (+0x594) freezes the whole machine
+  (black screen, hard reset needed). Writing RAW12 (0x2) stops the frames, and
+  camsv stays that way until it is soft-reset
+  ([camsv-output-format.md](camsv-output-format.md)).
+- Soft-resetting camsv at every stream start froze the machine twice while the
+  IR camera was started repeatedly. The reset is done only when the previous
+  stream delivered no frame at all.

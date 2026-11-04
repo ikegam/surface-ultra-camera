@@ -155,7 +155,8 @@ static const struct rw ir_omux[] = {
  */
 #define P2_CAMSV	0x3a500000
 static const struct rw ir_camsv_override[] = {
-	{ 0x0588, P2_W << 16 },	/* [H] GRAB_PXL_TAG2 = 0x02580000 (front 0x07800000) */
+	/* [H] GRAB_PXL_TAG2 = end << 16 | start (Windows: 0x02580000, front 0x07800000) */
+	{ 0x0588, (SUCAM_IR_GRAB_X + SUCAM_IR_W) << 16 | SUCAM_IR_GRAB_X },
 	{ 0x058c, P2_H << 16 },	/* [H] GRAB_LIN_TAG2 = 0x02580000 (front 0x04380000) */
 	/* +0x594 FORMAT_TAG2 = 1 (RAW10) unchanged [M]; RAW8 code unknown (probably 0) */
 };

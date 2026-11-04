@@ -20,28 +20,47 @@
 
 #define DRV_NAME	"surface-ultra-cam"
 
+/*
+ * Front camera: unpacked 10-bit Bayer, which libcamera's software ISP reads. A
+ * 1080p frame (4147200 bytes) fits the 4 MiB contiguous DMA limit (no CMA here).
+ */
+static const struct sucam_fmt sucam_front_fmts[] = {
+	{ V4L2_PIX_FMT_SGBRG10, SUCAM_W * 2, SUCAM_SV_RAW10 | SUCAM_SV_UNPACKED,
+	  "10-bit GBRG in 16 bits" },
+};
+
+/* IR: the software ISP has no mono path, so libcamera passes 8-bit grey through */
+static const struct sucam_fmt sucam_ir_fmts[] = {
+	{ V4L2_PIX_FMT_GREY, SUCAM_IR_W, SUCAM_SV_RAW8, "8-bit mono" },
+};
+
 const struct sucam_cfg sucam_front_cfg = {
 	.card = "Surface Laptop Ultra Camera",
 	.input = "Front camera",
-	.fmt_desc = "MTK packed 10-bit GBRG",
-	.fourcc = SUCAM_FOURCC,
-	.width = SUCAM_W, .height = SUCAM_H, .stride = SUCAM_STRIDE,
+	.width = SUCAM_W, .height = SUCAM_H,
+	.fmts = sucam_front_fmts, .nfmts = ARRAY_SIZE(sucam_front_fmts),
+	.sensor = "ov02c10", .mbus = MEDIA_BUS_FMT_SGBRG10_1X10,
+	.native = { 0, 0, SUCAM_SENSOR_W, SUCAM_SENSOR_H },
+	.crop = { 0, 0, SUCAM_W, SUCAM_H },	/* GBRG at (0, 0) */
 };
 
 const struct sucam_cfg sucam_ir_cfg = {
 	.ir = true,
 	.card = "Surface Laptop Ultra IR Camera",
 	.input = "IR camera",
-	.fmt_desc = "MTK packed 10-bit mono",
-	.fourcc = SUCAM_IR_FOURCC,
-	.width = SUCAM_IR_W, .height = SUCAM_IR_H, .stride = SUCAM_IR_STRIDE,
+	.width = SUCAM_IR_W, .height = SUCAM_IR_H,
+	.fmts = sucam_ir_fmts, .nfmts = ARRAY_SIZE(sucam_ir_fmts),
+	.sensor = "vd55g1", .mbus = MEDIA_BUS_FMT_Y10_1X10,
+	.native = { 0, 0, SUCAM_IR_SENSOR_W, SUCAM_IR_SENSOR_H },
+	/* Windows' 600x600 at (102, 52) (ir_tables.h), less what camsv drops */
+	.crop = { 102 + SUCAM_IR_GRAB_X, 52, SUCAM_IR_W, SUCAM_IR_H },
 };
 
 static struct platform_device *sucam_pdev[2];
 
 static u32 frame_size(const struct sucam *cam)
 {
-	return cam->cfg->stride * cam->cfg->height;
+	return cam->fmt->stride * cam->cfg->height;
 }
 
 static inline struct sucam_buf *to_sucam_buf(struct vb2_v4l2_buffer *vb)
@@ -316,6 +335,7 @@ static void sucam_stop_streaming(struct vb2_queue *q)
 	struct sucam *cam = vb2_get_drv_priv(q);
 
 	sucam_hw_halt(cam);
+	sucam_hw_stream_result(cam, cam->sequence);
 	sucam_return_all(cam, VB2_BUF_STATE_ERROR);
 	if (cam->dropped)
 		dev_info(cam->dev, "stream stopped: %u frames, %u dropped\n",
@@ -335,6 +355,12 @@ static int sucam_s_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct sucam *cam = container_of(ctrl->handler, struct sucam, ctrls);
 
+	if (ctrl->id == V4L2_CID_VBLANK) {
+		/* the exposure has to stay 8 lines below the frame length */
+		cam->vts = SUCAM_H + ctrl->val;
+		__v4l2_ctrl_modify_range(cam->exposure, SUCAM_EXP_MIN, cam->vts - 8, 1,
+					 min_t(s32, SUCAM_EXP_DEF, cam->vts - 8));
+	}
 	return sucam_sensor_set(cam, ctrl->id, ctrl->val);
 }
 
@@ -342,14 +368,35 @@ static const struct v4l2_ctrl_ops sucam_ctrl_ops = {
 	.s_ctrl = sucam_s_ctrl,
 };
 
+/* fixed controls describing the mode, which libcamera requires on a sensor */
+static void sucam_ro_ctrl(struct sucam *cam, u32 id, s64 val)
+{
+	struct v4l2_ctrl *c = v4l2_ctrl_new_std(&cam->ctrls, &sucam_ctrl_ops, id,
+						val, val, 1, val);
+
+	if (c)
+		c->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+}
+
+static void sucam_ro_orientation(struct sucam *cam)
+{
+	struct v4l2_ctrl *c = v4l2_ctrl_new_std_menu(&cam->ctrls, &sucam_ctrl_ops,
+						     V4L2_CID_CAMERA_ORIENTATION,
+						     V4L2_CAMERA_ORIENTATION_EXTERNAL, 0,
+						     V4L2_CAMERA_ORIENTATION_FRONT);
+
+	if (c)
+		c->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+}
+
 /* ---------- ioctls ---------- */
 static void sucam_fill_fmt(const struct sucam *cam, struct v4l2_pix_format *pix)
 {
 	pix->width = cam->cfg->width;
 	pix->height = cam->cfg->height;
-	pix->pixelformat = cam->cfg->fourcc;
+	pix->pixelformat = cam->fmt->fourcc;
 	pix->field = V4L2_FIELD_NONE;
-	pix->bytesperline = cam->cfg->stride;
+	pix->bytesperline = cam->fmt->stride;
 	pix->sizeimage = frame_size(cam);
 	pix->colorspace = V4L2_COLORSPACE_RAW;
 	pix->xfer_func = V4L2_XFER_FUNC_NONE;
@@ -367,20 +414,44 @@ static int sucam_querycap(struct file *file, void *fh, struct v4l2_capability *c
 	return 0;
 }
 
+static const struct sucam_fmt *sucam_find_fmt(const struct sucam *cam, u32 fourcc)
+{
+	unsigned int i;
+
+	for (i = 0; i < cam->cfg->nfmts; i++)
+		if (cam->cfg->fmts[i].fourcc == fourcc)
+			return &cam->cfg->fmts[i];
+	return NULL;
+}
+
 static int sucam_enum_fmt(struct file *file, void *fh, struct v4l2_fmtdesc *f)
 {
 	struct sucam *cam = video_drvdata(file);
 
-	if (f->index)
+	/* media-controller node: every format comes from the sensor's SGBRG10 bus */
+	if (f->mbus_code && f->mbus_code != cam->cfg->mbus)
 		return -EINVAL;
-	f->pixelformat = cam->cfg->fourcc;
-	strscpy(f->description, cam->cfg->fmt_desc, sizeof(f->description));
+	if (f->index >= cam->cfg->nfmts)
+		return -EINVAL;
+	f->pixelformat = cam->cfg->fmts[f->index].fourcc;
+	strscpy(f->description, cam->cfg->fmts[f->index].desc, sizeof(f->description));
 	return 0;
 }
 
-static int sucam_fmt(struct file *file, void *fh, struct v4l2_format *f)
+static int sucam_g_fmt(struct file *file, void *fh, struct v4l2_format *f)
 {
 	sucam_fill_fmt(video_drvdata(file), &f->fmt.pix);
+	return 0;
+}
+
+static int sucam_try_fmt(struct file *file, void *fh, struct v4l2_format *f)
+{
+	struct sucam *cam = video_drvdata(file);
+	const struct sucam_fmt *cur = cam->fmt;
+
+	cam->fmt = sucam_find_fmt(cam, f->fmt.pix.pixelformat) ?: cur;
+	sucam_fill_fmt(cam, &f->fmt.pix);
+	cam->fmt = cur;
 	return 0;
 }
 
@@ -390,6 +461,7 @@ static int sucam_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
 
 	if (vb2_is_busy(&cam->queue))
 		return -EBUSY;
+	cam->fmt = sucam_find_fmt(cam, f->fmt.pix.pixelformat) ?: cam->fmt;
 	sucam_fill_fmt(cam, &f->fmt.pix);
 	return 0;
 }
@@ -398,7 +470,7 @@ static int sucam_enum_framesizes(struct file *file, void *fh, struct v4l2_frmsiz
 {
 	struct sucam *cam = video_drvdata(file);
 
-	if (fs->index || fs->pixel_format != cam->cfg->fourcc)
+	if (fs->index || !sucam_find_fmt(cam, fs->pixel_format))
 		return -EINVAL;
 	fs->type = V4L2_FRMSIZE_TYPE_DISCRETE;
 	fs->discrete.width = cam->cfg->width;
@@ -411,7 +483,7 @@ static int sucam_enum_frameintervals(struct file *file, void *fh,
 {
 	struct sucam *cam = video_drvdata(file);
 
-	if (fi->index || fi->pixel_format != cam->cfg->fourcc ||
+	if (fi->index || !sucam_find_fmt(cam, fi->pixel_format) ||
 	    fi->width != cam->cfg->width || fi->height != cam->cfg->height)
 		return -EINVAL;
 	fi->type = V4L2_FRMIVAL_TYPE_DISCRETE;
@@ -455,8 +527,8 @@ static int sucam_s_input(struct file *file, void *fh, unsigned int i)
 static const struct v4l2_ioctl_ops sucam_ioctl_ops = {
 	.vidioc_querycap = sucam_querycap,
 	.vidioc_enum_fmt_vid_cap = sucam_enum_fmt,
-	.vidioc_g_fmt_vid_cap = sucam_fmt,
-	.vidioc_try_fmt_vid_cap = sucam_fmt,
+	.vidioc_g_fmt_vid_cap = sucam_g_fmt,
+	.vidioc_try_fmt_vid_cap = sucam_try_fmt,
 	.vidioc_s_fmt_vid_cap = sucam_s_fmt,
 	.vidioc_enum_framesizes = sucam_enum_framesizes,
 	.vidioc_enum_frameintervals = sucam_enum_frameintervals,
@@ -528,6 +600,8 @@ static int sucam_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	cam->dev = &pdev->dev;
 	cam->cfg = dev_get_platdata(&pdev->dev);
+	cam->fmt = &cam->cfg->fmts[0];
+	cam->vts = SUCAM_VTS;
 	mutex_init(&cam->lock);
 	spin_lock_init(&cam->qlock);
 	INIT_LIST_HEAD(&cam->queued);
@@ -547,22 +621,39 @@ static int sucam_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(cam->dev, ret, "hw init\n");
 
+	sucam_mc_init(cam);
 	ret = v4l2_device_register(cam->dev, &cam->v4l2_dev);
 	if (ret)
-		goto err_hw;
+		goto err_mdev;
 
-	v4l2_ctrl_handler_init(&cam->ctrls, 4);
+	v4l2_ctrl_handler_init(&cam->ctrls, 10);
 	if (cam->cfg->ir) {
-		/* the sensor's own AE by default; IR LED strobed with the exposure */
+		/* fixed exposure by default (SUCAM_IR_EXP_DEF); IR LED strobed with it */
 		v4l2_ctrl_new_std_menu(&cam->ctrls, &sucam_ctrl_ops, V4L2_CID_EXPOSURE_AUTO,
-				       V4L2_EXPOSURE_MANUAL, 0, V4L2_EXPOSURE_AUTO);
+				       V4L2_EXPOSURE_MANUAL, 0, V4L2_EXPOSURE_MANUAL);
 		cam->exposure = v4l2_ctrl_new_std(&cam->ctrls, &sucam_ctrl_ops, V4L2_CID_EXPOSURE,
 						  1, SUCAM_IR_EXP_MAX, 1, SUCAM_IR_EXP_DEF);
 		cam->again = v4l2_ctrl_new_std(&cam->ctrls, &sucam_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
 					       0, SUCAM_IR_AGAIN_MAX, 1, SUCAM_IR_AGAIN_DEF);
+		v4l2_ctrl_new_int_menu(&cam->ctrls, &sucam_ctrl_ops, V4L2_CID_AUTO_EXPOSURE_BIAS,
+				       ARRAY_SIZE(sucam_ir_ev_bias) - 1,
+				       ARRAY_SIZE(sucam_ir_ev_bias) / 2, sucam_ir_ev_bias);
 		v4l2_ctrl_new_std_menu(&cam->ctrls, &sucam_ctrl_ops, V4L2_CID_FLASH_LED_MODE,
 				       V4L2_FLASH_LED_MODE_FLASH, ~0x3, V4L2_FLASH_LED_MODE_FLASH);
+		sucam_ro_ctrl(cam, V4L2_CID_HBLANK, SUCAM_IR_LLP - SUCAM_IR_W);
+		sucam_ro_ctrl(cam, V4L2_CID_VBLANK, SUCAM_IR_FRAME_LENGTH - SUCAM_IR_H);
+		sucam_ro_ctrl(cam, V4L2_CID_PIXEL_RATE, SUCAM_IR_PIXEL_RATE);
+		sucam_ro_ctrl(cam, V4L2_CID_CAMERA_SENSOR_ROTATION, 0);
+		sucam_ro_orientation(cam);
 	} else {
+		/* frame timing first: VBLANK sets the exposure range */
+		sucam_ro_ctrl(cam, V4L2_CID_HBLANK, SUCAM_LLP - SUCAM_W);
+		sucam_ro_ctrl(cam, V4L2_CID_PIXEL_RATE, SUCAM_PIXEL_RATE);
+		sucam_ro_orientation(cam);
+		sucam_ro_ctrl(cam, V4L2_CID_CAMERA_SENSOR_ROTATION, 0);
+		v4l2_ctrl_new_std(&cam->ctrls, &sucam_ctrl_ops, V4L2_CID_VBLANK,
+				  SUCAM_SENSOR_H + 8 - SUCAM_H, SUCAM_VTS_MAX - SUCAM_H, 1,
+				  SUCAM_VTS - SUCAM_H);
 		cam->exposure = v4l2_ctrl_new_std(&cam->ctrls, &sucam_ctrl_ops, V4L2_CID_EXPOSURE,
 						  SUCAM_EXP_MIN, SUCAM_EXP_MAX, 1, SUCAM_EXP_DEF);
 		cam->again = v4l2_ctrl_new_std(&cam->ctrls, &sucam_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
@@ -574,7 +665,12 @@ static int sucam_probe(struct platform_device *pdev)
 		ret = cam->ctrls.error;
 		goto err_ctrl;
 	}
-	cam->v4l2_dev.ctrl_handler = &cam->ctrls;
+	/*
+	 * The controls live on the sensor subdev (for libcamera) and on the
+	 * video node (for plain V4L2 tools); keep them off the v4l2_device so that
+	 * registering the subdev does not merge the handler into itself.
+	 */
+	cam->vdev.ctrl_handler = &cam->ctrls;
 
 	q = &cam->queue;
 	q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -600,20 +696,33 @@ static int sucam_probe(struct platform_device *pdev)
 	cam->vdev.queue = q;
 	cam->vdev.device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING |
 				V4L2_CAP_READWRITE;
+	cam->vdev.device_caps |= V4L2_CAP_IO_MC;
+	cam->vdev.entity.function = MEDIA_ENT_F_IO_V4L;
+	cam->vpad.flags = MEDIA_PAD_FL_SINK;
+	ret = media_entity_pads_init(&cam->vdev.entity, 1, &cam->vpad);
+	if (ret)
+		goto err_ctrl;
 	video_set_drvdata(&cam->vdev, cam);
 	ret = video_register_device(&cam->vdev, VFL_TYPE_VIDEO, -1);
 	if (ret)
 		goto err_ctrl;
+	ret = sucam_mc_register(cam);
+	if (ret) {
+		video_unregister_device(&cam->vdev);
+		goto err_ctrl;
+	}
 
-	dev_info(cam->dev, "%s registered: %s, %ux%u %s @%u fps\n",
+	dev_info(cam->dev, "%s registered: %s, %ux%u %s @%u fps, %s\n",
 		 video_device_node_name(&cam->vdev), cam->cfg->card, cam->cfg->width,
-		 cam->cfg->height, cam->cfg->fmt_desc, SUCAM_FPS);
+		 cam->cfg->height, cam->fmt->desc, SUCAM_FPS,
+		 dev_name(&cam->mdev.devnode->dev));
 	return 0;
 
 err_ctrl:
 	v4l2_ctrl_handler_free(&cam->ctrls);
 	v4l2_device_unregister(&cam->v4l2_dev);
-err_hw:
+err_mdev:
+	media_device_cleanup(&cam->mdev);
 	sucam_hw_exit(cam);
 	return ret;
 }
@@ -622,9 +731,11 @@ static void sucam_remove(struct platform_device *pdev)
 {
 	struct sucam *cam = platform_get_drvdata(pdev);
 
+	sucam_mc_unregister(cam);
 	video_unregister_device(&cam->vdev);
 	v4l2_ctrl_handler_free(&cam->ctrls);
 	v4l2_device_unregister(&cam->v4l2_dev);
+	media_device_cleanup(&cam->mdev);
 	sucam_hw_exit(cam);
 }
 

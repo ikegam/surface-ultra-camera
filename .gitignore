@@ -7,8 +7,6 @@
 modules.order
 Module.symvers
 .module-common.o
-# rust
-/sucamd/target/
 # never commit the NVIDIA firmware
 /firmware/*.img
 /firmware/*.bin

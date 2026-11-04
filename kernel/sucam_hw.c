@@ -55,6 +55,7 @@
 /* camsv central */
 #define SV_SEN_MODE	0x140
 #define SV_VF_CON	0x148
+#define SV_FORMAT_TAG2	0x594
 #define SV_MODULE_DB	0x1b4
 #define SV_FBC0_TAG2	0x580
 #define SV_FBC1_TAG2	0x584
@@ -229,6 +230,15 @@ int sucam_sensor_set(struct sucam *cam, u32 id, s32 val)
 		ret |= ov_write(cam, 0x350b, ((val << 6) >> 8) & 0xff);
 		ret |= ov_write(cam, 0x350c, (val << 6) & 0xff);
 		break;
+	case V4L2_CID_VBLANK:		/* frame length (VTS) @0x380e */
+		ret |= ov_write(cam, 0x380e, cam->vts >> 8);
+		ret |= ov_write(cam, 0x380f, cam->vts & 0xff);
+		break;
+	case V4L2_CID_HBLANK:		/* read-only description of the mode */
+	case V4L2_CID_PIXEL_RATE:
+	case V4L2_CID_CAMERA_ORIENTATION:
+	case V4L2_CID_CAMERA_SENSOR_ROTATION:
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -286,10 +296,6 @@ static int sensor_stream(struct sucam *cam, bool on)
 		if (ret)
 			return ret;
 	}
-	ret = ov_write(cam, 0x380e, SUCAM_VTS >> 8);		/* frame length for 30 fps */
-	ret = ret ?: ov_write(cam, 0x380f, SUCAM_VTS & 0xff);
-	if (ret)
-		return ret;
 	ret = v4l2_ctrl_handler_setup(&cam->ctrls);	/* exposure / gains (own lock) */
 	if (ret)
 		return ret;
@@ -373,10 +379,78 @@ static void phy_mac_setup(struct sucam *cam)
 	iounmap(sn);
 }
 
+/*
+ * Reset camsv_b (MTK mtk_cam-sv.c sv_reset + sv_reset_by_camsys_top): DMA top,
+ * central and CQ DMA soft resets, then the camsys-level reset of this camsv.
+ * A bad configuration (e.g. FORMAT_TAG2 = RAW12 against a RAW10 sensor) leaves
+ * camsv dropping every frame until it is reset. MediaTek only resets on error
+ * recovery, and resetting at every stream start hung the machine twice while
+ * the IR camera was started and stopped repeatedly, so only reset after a
+ * stream that delivered no frame (camsv_b is shared by both cameras).
+ */
+static int sv_reset = 1;
+module_param(sv_reset, int, 0644);
+MODULE_PARM_DESC(sv_reset, "reset camsv at stream start: 0 never, 1 after a stream without frames, 2 always");
+static bool camsv_suspect;
+
+void sucam_hw_stream_result(struct sucam *cam, u32 frames)
+{
+	camsv_suspect = !frames;
+}
+
+#define SV_DMATOP_SW_RST	(0x1000 + 0x020)
+#define SV_CENTRAL_DCM_DIS	0x07c
+#define SV_CENTRAL_SW_CTL	0x1d0
+#define SV_SCQ_SW_RST		(0x2000 + 0x010)
+#define CAM_MAIN_SW_RST_1	0x058
+#define CAMSV_B_ID		1
+
+static void camsv_reset(struct sucam *cam)
+{
+	void __iomem *sv = cam->sv, *cm;
+	u32 v;
+	int r1, r2;
+
+	writel(readl(sv + SV_SEN_MODE) & ~BIT(0), sv + SV_SEN_MODE);
+	writel(readl(sv + SV_VF_CON) & ~BIT(0), sv + SV_VF_CON);
+
+	writel(0, sv + SV_DMATOP_SW_RST);
+	writel(1, sv + SV_DMATOP_SW_RST);
+	wmb();
+	r1 = readl_poll_timeout(sv + SV_DMATOP_SW_RST, v, v & 2, 1, 100000);
+	writel(0, sv + SV_CENTRAL_DCM_DIS);
+	writel(0, sv + SV_CENTRAL_SW_CTL);
+	writel(1, sv + SV_CENTRAL_SW_CTL);
+	writel(0, sv + SV_DMATOP_SW_RST);
+	writel(0, sv + SV_CENTRAL_SW_CTL);
+	wmb();
+
+	writel(0, sv + SV_SCQ_SW_RST);
+	writel(1, sv + SV_SCQ_SW_RST);
+	wmb();
+	r2 = readl_poll_timeout(sv + SV_SCQ_SW_RST, v, v & 2, 1, 100000);
+	writel(0, sv + SV_SCQ_SW_RST);
+
+	cm = ioremap(CAM_MAIN, 0x1000);
+	if (cm) {
+		writel(0, cm + CAM_MAIN_SW_RST_1);
+		writel(3 << (CAMSV_B_ID * 2), cm + CAM_MAIN_SW_RST_1);
+		writel(0, cm + CAM_MAIN_SW_RST_1);
+		iounmap(cm);
+	}
+	wmb();
+	dev_info(cam->dev, "camsv reset: dma %s, cq %s\n",
+		 r1 ? "timeout" : "ok", r2 ? "timeout" : "ok");
+}
+
 static void camsv_setup(struct sucam *cam, dma_addr_t addr)
 {
 	void __iomem *sv = cam->sv, *cm;
 	int i;
+
+	if (sv_reset == 2 || (sv_reset == 1 && camsv_suspect))
+		camsv_reset(cam);
+	camsv_suspect = false;
 
 	for (i = 0; i < ARRAY_SIZE(g_camsv1); i++)
 		writel(g_camsv1[i].val, sv + g_camsv1[i].off);
@@ -384,10 +458,11 @@ static void camsv_setup(struct sucam *cam, dma_addr_t addr)
 		writel(g_camsv1dma[i].val, sv + g_camsv1dma[i].off);
 	if (cam->cfg->ir)		/* grab size 600x600 */
 		writes(sv, ir_camsv_override, ARRAY_SIZE(ir_camsv_override));
+	writel(cam->fmt->sv_fmt, sv + SV_FORMAT_TAG2);
 	/* per-frame DMA regs (Windows writes these via CQ into the inner bank) */
 	writel(lower_32_bits(addr), sv + SV_WDMA_ADDR_IMG2);
 	writel(upper_32_bits(addr), sv + SV_WDMA_ADDR_MSB_IMG2);
-	writel((cam->cfg->stride << 16) | 0x10, sv + SV_WDMA_BASIC_IMG2);
+	writel((cam->fmt->stride << 16) | 0x10, sv + SV_WDMA_BASIC_IMG2);
 	writel(FBC_EN, sv + SV_FBC0_TAG2);
 	writel(FBC_EN | FBC_RCNT_INC, sv + SV_FBC0_TAG2);	/* 1 buffer available */
 	wmb();
@@ -625,6 +700,7 @@ static const struct acpi_gpio_params avdd_gpio = { 1, 0, false };
 static const struct acpi_gpio_params reset_gpio = { 2, 0, true };
 static const struct acpi_gpio_params mclk_gpio = { 3, 0, false };
 static const struct acpi_gpio_params pled_gpio = { 4, 0, false };
+static const struct acpi_gpio_params ir_pled_gpio = { 3, 0, false };	/* same pin 43 */
 
 /* \_SB.CAMF lists its GPIOs by position only; names come from a vendor _DSM */
 static const struct acpi_gpio_mapping sucam_gpios[] = {
@@ -650,6 +726,7 @@ static const struct acpi_gpio_mapping sucam_ir_gpios[] = {
 	{ "campower-gpios", &campower_gpio, 1 },
 	{ "avdd-gpios", &avdd_gpio, 1 },
 	{ "reset-gpios", &reset_gpio, 1 },
+	{ "pled-gpios", &ir_pled_gpio, 1 },
 	{ }
 };
 
@@ -672,11 +749,17 @@ int sucam_hw_init(struct sucam *cam)
 	if (ret)
 		goto err_put;
 	for (i = 0; i < SUCAM_GPIO_NUM; i++) {
-		if (cam->cfg->ir && (i == SUCAM_GPIO_MCLK || i == SUCAM_GPIO_PLED))
-			continue;	/* not used by the IR camera (NULL = no-op) */
-		/* logical 0 = off; reset is active-low so 1 = held in reset */
+		if (cam->cfg->ir && i == SUCAM_GPIO_MCLK)
+			continue;	/* the IR camera has its own oscillator (NULL = no-op) */
+		/*
+		 * logical 0 = off; reset is active-low so 1 = held in reset. Both
+		 * cameras list pled (pin 43); they never stream at the same time.
+		 */
 		cam->gpio[i] = gpiod_get(cam->sensor_dev, sucam_gpio_names[i],
-					 i == SUCAM_GPIO_RESET ? GPIOD_OUT_HIGH : GPIOD_OUT_LOW);
+					 i == SUCAM_GPIO_RESET ? GPIOD_OUT_HIGH :
+					 i == SUCAM_GPIO_PLED ?
+					 GPIOD_OUT_LOW | GPIOD_FLAGS_BIT_NONEXCLUSIVE :
+					 GPIOD_OUT_LOW);
 		if (IS_ERR(cam->gpio[i])) {
 			ret = PTR_ERR(cam->gpio[i]);
 			dev_err(cam->dev, "%s gpio: %d\n", sucam_gpio_names[i], ret);
