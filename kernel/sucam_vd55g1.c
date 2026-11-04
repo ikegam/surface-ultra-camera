@@ -31,6 +31,7 @@
 #define VD_NEXT_CTX		0x03e4
 #define VD_PATCH		0x2000
 /* context 0 */
+#define VD_AE_TARGET_PERCENTAGE	0x0486	/* default 27 */
 #define VD_EXP_MODE		0x0500
 #define  EXP_AUTO		0
 #define  EXP_MANUAL		2
@@ -102,6 +103,12 @@ static int vd_wait(struct sucam *cam, u16 reg, u8 want)
 	return read_poll_timeout(vd_read8, v, v == want, 2000, 500000, false, cam, reg);
 }
 
+/* the in-tree vd55g1 driver's exposure bias: AE target 27 % * 2^EV */
+const s64 sucam_ir_ev_bias[13] = {
+	-3000, -2500, -2000, -1500, -1000, -500, 0, 500, 1000, 1500, 2000, 2500, 3000,
+};
+const u8 sucam_ir_ae_target[13] = { 3, 5, 7, 10, 14, 19, 27, 38, 54, 76, 108, 153, 216 };
+
 int sucam_vd_set(struct sucam *cam, u32 id, s32 val)
 {
 	if (!cam->powered)
@@ -109,6 +116,8 @@ int sucam_vd_set(struct sucam *cam, u32 id, s32 val)
 	switch (id) {
 	case V4L2_CID_EXPOSURE_AUTO:
 		return vd_write8(cam, VD_EXP_MODE, val == V4L2_EXPOSURE_AUTO ? EXP_AUTO : EXP_MANUAL);
+	case V4L2_CID_AUTO_EXPOSURE_BIAS:	/* AE target 27 % * 2^EV, as in vd55g1.c */
+		return vd_write8(cam, VD_AE_TARGET_PERCENTAGE, sucam_ir_ae_target[val]);
 	case V4L2_CID_EXPOSURE:		/* lines, used in manual mode */
 		return vd_write16(cam, VD_MANUAL_EXPOSURE, val);
 	case V4L2_CID_ANALOGUE_GAIN:	/* gain = 32 / (32 - val) */
@@ -116,6 +125,12 @@ int sucam_vd_set(struct sucam *cam, u32 id, s32 val)
 	case V4L2_CID_FLASH_LED_MODE:	/* IR LED: strobed with the exposure, or off */
 		return vd_write8(cam, VD_GPIO2_CTRL,
 				 val == V4L2_FLASH_LED_MODE_NONE ? GPIO_IN : GPIO_STROBE);
+	case V4L2_CID_HBLANK:		/* read-only description of the mode */
+	case V4L2_CID_VBLANK:
+	case V4L2_CID_PIXEL_RATE:
+	case V4L2_CID_CAMERA_ORIENTATION:
+	case V4L2_CID_CAMERA_SENSOR_ROTATION:
+		return 0;
 	default:
 		return -EINVAL;
 	}
@@ -127,6 +142,7 @@ int sucam_vd_power(struct sucam *cam, bool on)
 	int i, ret;
 
 	if (!on) {
+		gpiod_set_value_cansleep(cam->gpio[SUCAM_GPIO_PLED], 0);
 		gpiod_set_value_cansleep(cam->gpio[SUCAM_GPIO_RESET], 1);
 		gpiod_set_value_cansleep(cam->gpio[SUCAM_GPIO_AVDD], 0);
 		gpiod_set_value_cansleep(cam->gpio[SUCAM_GPIO_CAMPOWER], 0);
@@ -135,6 +151,8 @@ int sucam_vd_power(struct sucam *cam, bool on)
 	}
 	gpiod_set_value_cansleep(cam->gpio[SUCAM_GPIO_CAMPOWER], 1);
 	gpiod_set_value_cansleep(cam->gpio[SUCAM_GPIO_AVDD], 1);
+	/* ACPI lists pled for the IR camera too: indicator, possibly the IR LED enable */
+	gpiod_set_value_cansleep(cam->gpio[SUCAM_GPIO_PLED], 1);
 	usleep_range(5000, 6000);
 	gpiod_set_value_cansleep(cam->gpio[SUCAM_GPIO_RESET], 0);	/* deassert */
 	ret = vd_wait(cam, VD_FSM, FSM_READY_TO_BOOT);

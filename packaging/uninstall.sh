@@ -6,6 +6,7 @@ set -uo pipefail
 [ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
 PKG=surface-ultra-camera
 
+# sucamd: the 0.1 release
 systemctl disable --now sucamd sucamd-ir 2>/dev/null
 rm -f /etc/systemd/system/sucamd.service /etc/systemd/system/sucamd-ir.service /usr/local/bin/sucamd
 systemctl daemon-reload
@@ -14,5 +15,8 @@ for v in $(dkms status "$PKG" 2>/dev/null | sed -n "s#^$PKG/\([^,]*\),.*#\1#p" |
 	dkms remove "$PKG/$v" --all
 	rm -rf "/usr/src/$PKG-$v"
 done
-rm -f /etc/modprobe.d/$PKG.conf /etc/modules-load.d/$PKG.conf
-echo "removed (v4l2loopback stays loaded until reboot or 'sudo rmmod v4l2loopback')"
+rm -f /etc/modprobe.d/$PKG.conf /etc/modules-load.d/$PKG.conf \
+	/usr/share/libcamera/configuration.yaml /usr/share/libcamera/ipa/simple/ov02c10.yaml \
+	/usr/share/wireplumber/wireplumber.conf.d/50-surface-ultra-camera.conf \
+	/usr/lib/environment.d/50-$PKG.conf
+echo "removed"
