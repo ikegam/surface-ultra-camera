@@ -18,7 +18,7 @@ camera hardware directly through its registers, so a bug can hang the system.
 
 | Feature | Status |
 |---|---|
-| Front camera (OmniVision OV02C10) | **Works**: 1920x1080 raw Bayer, turned into a colour image by libcamera's software ISP. 30 fps, about a third of one CPU core |
+| Front camera (OmniVision OV02C10) | **Works**: 1920x1080 colour at 30 fps (the sensor's full 1928-column raw Bayer, turned into colour by libcamera's software ISP), about a third of one CPU core |
 | Auto exposure / white balance | **Works** (libcamera's software ISP) |
 | IR camera (ST VD55G1) | **Works**: 592x600 grey, 30 fps, lit by the IR LED. Not at the same time as the front camera. Face authentication (as Windows Hello does) is out of scope |
 | Privacy LED | On only while a camera is running |

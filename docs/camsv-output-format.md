@@ -19,5 +19,6 @@ OV02C10 sending RAW10). Windows writes 0x1 (MTK packed RAW10).
 | bits 22-31 | not tested |
 
 No CSI-2 packed (`SGBRG10P`) setting was found in bits 3-20. Unpacked 16-bit is
-enough for SoftISP; a 1920x1080 frame is 4147200 bytes, just under the 4 MiB
-contiguous DMA limit of this machine (no CMA).
+enough for SoftISP. (These tests ran at 1920 columns; the driver now grabs
+1928, see [how-it-works](how-it-works.md#raw-format).) A 1928x1080 frame is
+4164480 bytes, just under the 4 MiB contiguous DMA limit of this machine (no CMA).

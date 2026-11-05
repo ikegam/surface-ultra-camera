@@ -310,6 +310,24 @@ static int sensor_stream(struct sucam *cam, bool on)
  * (1, 7) must be 0 and the unused ones are parked at 3. outmux registers are
  * double-buffered (cfg_mode NORMAL): SW_CFG_DONE (+0x1c) latches them.
  */
+/*
+ * Front camera at the full sensor width. Windows streams 1920x1080, which is
+ * what the golden tables hold; these widen the outmux tag sizes and the camsv
+ * grab to SUCAM_W (sucam.h says why). Same registers the IR path overrides.
+ */
+#define OMUX_TAG_SIZE(w, h)	((((h) - 1) << 16) | ((w) - 1))	/* 0x0437077f at 1920x1080 */
+#define OMUX_TAG_WH(w, h)	(((w) << 16) | (h))		/* 0x07800438 at 1920x1080 */
+static const struct omw front_omux[] = {
+	{ 1, 0x0a0, OMUX_TAG_SIZE(SUCAM_W, SUCAM_H) },
+	{ 1, 0x0ac, OMUX_TAG_WH(SUCAM_W, SUCAM_H) },
+	{ 7, 0x084, OMUX_TAG_SIZE(SUCAM_W, SUCAM_H) },
+	{ 7, 0x090, OMUX_TAG_WH(SUCAM_W, SUCAM_H) },
+};
+static const struct rw front_camsv[] = {
+	{ 0x0588, SUCAM_W << 16 },	/* GRAB_PXL_TAG2 = end << 16 | start */
+	{ 0x058c, SUCAM_H << 16 },	/* GRAB_LIN_TAG2 (unchanged) */
+};
+
 static void outmux_setup(struct sucam *cam)
 {
 	static const u8 nonwaived[] = { 0, 1, 4, 6, 7, 9, 11, 13 };
@@ -323,6 +341,9 @@ static void outmux_setup(struct sucam *cam)
 	if (cam->cfg->ir)		/* outmux1 from async 2, 600x600 */
 		for (k = 0; k < ARRAY_SIZE(ir_omux); k++)
 			writel(ir_omux[k].val, oa + IR_OUTMUX * 0x10000 + ir_omux[k].off);
+	else
+		for (k = 0; k < ARRAY_SIZE(front_omux); k++)
+			writel(front_omux[k].val, oa + front_omux[k].mux * 0x10000 + front_omux[k].off);
 	wmb();
 	for (k = 0; k < ARRAY_SIZE(nonwaived); k++)
 		writel(1, oa + nonwaived[k] * 0x10000 + 0x1c);
@@ -458,6 +479,8 @@ static void camsv_setup(struct sucam *cam, dma_addr_t addr)
 		writel(g_camsv1dma[i].val, sv + g_camsv1dma[i].off);
 	if (cam->cfg->ir)		/* grab size 600x600 */
 		writes(sv, ir_camsv_override, ARRAY_SIZE(ir_camsv_override));
+	else
+		writes(sv, front_camsv, ARRAY_SIZE(front_camsv));
 	writel(cam->fmt->sv_fmt, sv + SV_FORMAT_TAG2);
 	/* per-frame DMA regs (Windows writes these via CQ into the inner bank) */
 	writel(lower_32_bits(addr), sv + SV_WDMA_ADDR_IMG2);
