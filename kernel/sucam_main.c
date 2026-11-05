@@ -2,7 +2,7 @@
 /*
  * Surface Laptop Ultra front camera: V4L2 capture device.
  *
- * Exposes the OV02C10 raw stream (1920x1080, MediaTek-packed 10-bit GBRG) as a
+ * Exposes the OV02C10 raw stream (1928x1080, MediaTek-packed 10-bit GBRG) as a
  * single video node. The sensor (and its privacy LED) is powered only while
  * streaming. Requires surface_ccu_boot to have booted the CCU firmware.
  */
@@ -22,7 +22,7 @@
 
 /*
  * Front camera: unpacked 10-bit Bayer, which libcamera's software ISP reads. A
- * 1080p frame (4147200 bytes) fits the 4 MiB contiguous DMA limit (no CMA here).
+ * 1928x1080 frame (4164480 bytes) fits the 4 MiB contiguous DMA limit (no CMA here).
  */
 static const struct sucam_fmt sucam_front_fmts[] = {
 	{ V4L2_PIX_FMT_SGBRG10, SUCAM_W * 2, SUCAM_SV_RAW10 | SUCAM_SV_UNPACKED,

@@ -21,10 +21,17 @@
 #include <media/v4l2-subdev.h>
 #include <media/videobuf2-v4l2.h>
 
-#define SUCAM_W		1920
+/*
+ * camsv grabs all 1928 columns of the sensor's 2-lane mode and its top 1080
+ * lines. The full width matters: libcamera's software ISP gives up 2 columns
+ * on each side to demosaic, so from 1920 it could only offer 1916x1080, and
+ * PipeWire then listed nothing above 1680x1050 (no 1080p for browsers).
+ * 1928 * 2 * 1080 = 4164480 bytes, still under the 4 MiB DMA limit.
+ */
+#define SUCAM_W		1928
 #define SUCAM_H		1080
 #define SUCAM_FPS	30
-/* the sensor's full 2-lane mode; camsv grabs its top-left 1920x1080 */
+/* the sensor's full 2-lane mode */
 #define SUCAM_SENSOR_W	1928
 #define SUCAM_SENSOR_H	1092
 

@@ -143,11 +143,18 @@ instead of overwriting a buffer the application is holding.
 
 ## Raw format
 
-1920x1080 (camsv crops it from the sensor's 1928x1092), 10-bit Bayer **GBRG**,
-written unpacked into 16 bits per pixel (little-endian, upper 6 bits zero).
-That is V4L2 `SGBRG10` (fourcc `GB10`), 3840 bytes per line, black level 64. A
-frame is 4147200 bytes, just under the largest contiguous DMA buffer this
-machine can allocate (4 MiB, no CMA).
+1928x1080 (camsv takes the full width and the top 1080 lines of the sensor's
+1928x1092), 10-bit Bayer **GBRG**, written unpacked into 16 bits per pixel
+(little-endian, upper 6 bits zero). That is V4L2 `SGBRG10` (fourcc `GB10`),
+3856 bytes per line, black level 64. A frame is 4164480 bytes, just under the
+largest contiguous DMA buffer this machine can allocate (4 MiB, no CMA).
+
+The full width is what makes 1080p possible: the software ISP gives up 2
+columns on each side to demosaic. Windows grabs 1920 columns (as 0.2 did),
+which left libcamera at 1916x1080 at most, and PipeWire then offered nothing
+above 1680x1050. From 1928 columns it outputs up to 1924x1080, so 1920x1080 is
+offered. The outmux tag sizes and the camsv grab are widened over the Windows
+register values for this (`front_omux` / `front_camsv` in `sucam_hw.c`).
 
 Windows uses 10 bits packed the MediaTek way (2400 bytes per line), which
 libcamera's software ISP cannot read. A sweep found that bit 6 of camsv's
