@@ -622,30 +622,74 @@ static int hw_start_locked(struct sucam *cam, dma_addr_t first)
 	return ret;
 }
 
-static int hw_start_once(struct sucam *cam, dma_addr_t first)
+/*
+ * The HFRP firmware counts "on" requests, and the driver never sends "off"
+ * (whether "off" is counted or absolute is unknown, and the CCU needs these
+ * clocks). Sending them at every stream start made the counts overflow: about
+ * the 63rd start of a boot timed out in the HFRP mailbox ("HFRP clocks: -110")
+ * and the SoC reset itself a minute later (BERT MTKID record, byte 0x2c =
+ * 0x0400). So request everything once per power cycle of the camera island:
+ * at the first stream after boot or after a system suspend.
+ */
+static bool hfrp_common_on;	/* domains, CCU + camsv clocks */
+static bool hfrp_phy_on[2];	/* CSI PHY clock + rate, [0] front, [1] IR */
+
+void sucam_hw_power_lost(void)
+{
+	hfrp_common_on = false;
+	hfrp_phy_on[0] = hfrp_phy_on[1] = false;
+}
+
+static int hfrp_request_once(struct sucam *cam)
 {
 	/* camsv_a + camsv_b (clarb13 0xa00, camsv_b 0xa18) and the CAM main clocks */
-	static const u32 sv_clks[] = { 0xa04, 0xa01, 0xa0b, 0xa10, 0xa11, 0xa12, 0xa13,
+	static const u32 sv_clks[] = { 0xa01, 0xa0b, 0xa10, 0xa11, 0xa12, 0xa13,
 				       0xa17, 0xa00, 0xa18 };
 	/* seninf + CCU power domains and the CCU/seninf clocks (as surface_ccu_boot) */
 	static const u32 domains[] = { 0, 2, 5 };
 	static const u32 ccu_clks[] = { 0xa04, 0xa09, 0xa0a, 0x1a00, 0x1a01, 0x1a02, 0x1a04,
 					0x652 };
-	const struct ccucmd *t;
-	int i, ss, n, ret = 0;
+	bool ir = cam->cfg->ir;
+	int i, ret = 0;
 
 	/*
-	 * Make sure the camera island is powered BEFORE touching any of its MMIO:
-	 * after a system suspend it is off, and a read of a powered-off block stalls
-	 * the bus (unkillable task). Idempotent if already on.
+	 * The camera island must be powered BEFORE any of its MMIO is touched:
+	 * after a system suspend it is off, and a read of a powered-off block
+	 * stalls the bus (unkillable task).
 	 */
-	for (i = 0; i < ARRAY_SIZE(domains) && !ret; i++)
-		ret = hfrp_power(cam, domains[i], true);
-	ret = ret ?: hfrp_clocks(cam, ccu_clks, ARRAY_SIZE(ccu_clks), true);
-	if (ret) {
-		dev_err(cam->dev, "HFRP power: %d\n", ret);
-		return ret;
+	if (!hfrp_common_on) {
+		for (i = 0; i < ARRAY_SIZE(domains) && !ret; i++)
+			ret = hfrp_power(cam, domains[i], true);
+		ret = ret ?: hfrp_clocks(cam, ccu_clks, ARRAY_SIZE(ccu_clks), true);
+		ret = ret ?: hfrp_clocks(cam, sv_clks, ARRAY_SIZE(sv_clks), true);
+		if (ret) {
+			dev_err(cam->dev, "HFRP power: %d\n", ret);
+			return ret;
+		}
+		hfrp_common_on = true;
 	}
+
+	/* CSI PHY clock (0x813 + port) and its rate (id 6 + port) */
+	if (!hfrp_phy_on[ir]) {
+		ret = hfrp_clocks(cam, (u32[]){ ir ? 0x815 : 0x813 }, 1, true);
+		ret = ret ?: hfrp_clock_rate(cam, ir ? 8 : 6, 312);
+		if (ret) {
+			dev_err(cam->dev, "HFRP clocks: %d\n", ret);
+			return ret;
+		}
+		hfrp_phy_on[ir] = true;
+	}
+	return 0;
+}
+
+static int hw_start_once(struct sucam *cam, dma_addr_t first)
+{
+	const struct ccucmd *t;
+	int ss, n, ret;
+
+	ret = hfrp_request_once(cam);
+	if (ret)
+		return ret;
 	if (readl(cam->ccu + CCU_HANDSHAKE) != CCU_READY) {
 		dev_err(cam->dev, "CCU firmware not running (load surface_ccu_boot go=1)\n");
 		return -EIO;
@@ -655,14 +699,6 @@ static int hw_start_once(struct sucam *cam, dma_addr_t first)
 		if (t[ss].ft == CCU_FT_SENINF && t[ss].cmd == 0x1)
 			break;	/* MSG_SENINF_SET_SENSOR */
 
-	/* CSI PHY clock (0x813 + port) and its rate (id 6 + port) */
-	ret = hfrp_clocks(cam, (u32[]){ cam->cfg->ir ? 0x815 : 0x813 }, 1, true);
-	ret = ret ?: hfrp_clock_rate(cam, cam->cfg->ir ? 8 : 6, 312);
-	ret = ret ?: hfrp_clocks(cam, sv_clks, ARRAY_SIZE(sv_clks), true);
-	if (ret) {
-		dev_err(cam->dev, "HFRP clocks: %d\n", ret);
-		return ret;
-	}
 	ret = sensor_power(cam, true);
 	if (ret)
 		return ret;

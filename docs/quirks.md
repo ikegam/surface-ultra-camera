@@ -64,6 +64,16 @@ the task can no longer be killed. On stream start the driver asks HFRP for the
 power domains before touching any camera register, so this is safe even after
 system suspend.
 
+## HFRP counts "on" requests, and an overflow resets the SoC
+
+HFRP appears to count the power-domain and clock "on" requests. Up to 0.2.1
+the driver sent them at every stream start and never sent "off", so at about
+the 62nd stream start of a boot the HFRP mailbox stopped answering
+(`HFRP clocks: -110`) and about a minute later the whole SoC reset. Nothing
+lands in pstore; the next boot's BERT has an MTKID record (0x0400 at offset
+0x2c). Since 0.2.2 the driver sends the requests once, at the first stream
+after boot and after system suspend.
+
 ## The stock ov02c10 driver is blacklisted
 
 Mainline `ov02c10` binds to the same ACPI device as well, but on this machine
