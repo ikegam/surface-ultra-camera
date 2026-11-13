@@ -169,7 +169,7 @@ int sucam_hw_start(struct sucam *cam, dma_addr_t first);
 void sucam_hw_stop(struct sucam *cam);
 void sucam_hw_arm(struct sucam *cam, dma_addr_t addr);
 u8 sucam_hw_wcnt(struct sucam *cam);
-void sucam_hw_power_lost(void);
+void sucam_hw_power_release(struct sucam *cam);
 bool sucam_hw_sof(struct sucam *cam);
 void sucam_hw_diag(struct sucam *cam);
 void sucam_hw_stream_result(struct sucam *cam, u32 frames);

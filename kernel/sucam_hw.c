@@ -634,21 +634,38 @@ static int hw_start_locked(struct sucam *cam, dma_addr_t first)
 static bool hfrp_common_on;	/* domains, CCU + camsv clocks */
 static bool hfrp_phy_on[2];	/* CSI PHY clock + rate, [0] front, [1] IR */
 
-void sucam_hw_power_lost(void)
+/* camsv_a + camsv_b (clarb13 0xa00, camsv_b 0xa18) and the CAM main clocks */
+static const u32 sv_clks[] = { 0xa01, 0xa0b, 0xa10, 0xa11, 0xa12, 0xa13, 0xa17, 0xa00, 0xa18 };
+/* seninf + CCU power domains and the CCU/seninf clocks (as surface_ccu_boot) */
+static const u32 domains[] = { 0, 2, 5 };
+static const u32 ccu_clks[] = { 0xa04, 0xa09, 0xa0a, 0x1a00, 0x1a01, 0x1a02, 0x1a04, 0x652 };
+
+/*
+ * Withdraw what hfrp_request_once() asked for, before a system suspend, so
+ * the HFRP can power the camera island off (surface_ccu_boot withdraws its
+ * own requests in suspend_late). The island must be off in s2idle: left on,
+ * the SoC occasionally reset on entering DRIPS. Requests are counted, so
+ * only what was requested is withdrawn, once.
+ */
+void sucam_hw_power_release(struct sucam *cam)
 {
+	int i;
+
+	for (i = 0; i < 2; i++)
+		if (hfrp_phy_on[i])
+			hfrp_clocks(cam, (u32[]){ i ? 0x815 : 0x813 }, 1, false);
+	if (hfrp_common_on) {
+		hfrp_clocks(cam, sv_clks, ARRAY_SIZE(sv_clks), false);
+		hfrp_clocks(cam, ccu_clks, ARRAY_SIZE(ccu_clks), false);
+		for (i = ARRAY_SIZE(domains) - 1; i >= 0; i--)
+			hfrp_power(cam, domains[i], false);
+	}
 	hfrp_common_on = false;
 	hfrp_phy_on[0] = hfrp_phy_on[1] = false;
 }
 
 static int hfrp_request_once(struct sucam *cam)
 {
-	/* camsv_a + camsv_b (clarb13 0xa00, camsv_b 0xa18) and the CAM main clocks */
-	static const u32 sv_clks[] = { 0xa01, 0xa0b, 0xa10, 0xa11, 0xa12, 0xa13,
-				       0xa17, 0xa00, 0xa18 };
-	/* seninf + CCU power domains and the CCU/seninf clocks (as surface_ccu_boot) */
-	static const u32 domains[] = { 0, 2, 5 };
-	static const u32 ccu_clks[] = { 0xa04, 0xa09, 0xa0a, 0x1a00, 0x1a01, 0x1a02, 0x1a04,
-					0x652 };
 	bool ir = cam->cfg->ir;
 	int i, ret = 0;
 
