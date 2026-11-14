@@ -74,6 +74,19 @@ lands in pstore; the next boot's BERT has an MTKID record (0x0400 at offset
 0x2c). Since 0.2.2 the driver sends the requests once, at the first stream
 after boot and after system suspend.
 
+## The camera island must be powered off for suspend
+
+`surface_ccu_boot` boots the CCU at probe and, up to 0.2.2, kept its HFRP
+power and clock requests for the whole boot; `surface_ultra_cam` also never
+withdrew its own. The camera island therefore stayed powered through s2idle
+(the CCU firmware was still running after every resume), and about one lid-close
+suspend in six reset the SoC as it entered its deepest idle state (DRIPS). The
+first boot afterwards could hang with the NVIDIA GSP and the RoT unresponsive
+until a long press of the power button. Windows powers the camera off in
+standby. Since 0.2.3 `surface_ultra_cam` withdraws its requests in suspend,
+`surface_ccu_boot` withdraws its own in suspend_late and boots the CCU again
+in resume_early (`surface_ccu_boot.suspend_off=0` restores the old behaviour).
+
 ## The stock ov02c10 driver is blacklisted
 
 Mainline `ov02c10` binds to the same ACPI device as well, but on this machine

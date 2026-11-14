@@ -568,7 +568,7 @@ static int sucam_suspend(struct device *dev)
 
 	mutex_lock(&cam->lock);
 	sucam_hw_halt(cam);	/* sensor + LED off; buffers stay queued */
-	sucam_hw_power_lost();	/* the camera island powers off across suspend */
+	sucam_hw_power_release(cam);	/* let the HFRP power the camera island off */
 	mutex_unlock(&cam->lock);
 	return 0;
 }

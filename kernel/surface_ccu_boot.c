@@ -84,6 +84,10 @@ static bool go;
 module_param(go, bool, 0444);
 MODULE_PARM_DESC(go, "actually power the CCU and send ROT0 command 0x18 (default: dry run)");
 
+static bool suspend_off = true;
+module_param(suspend_off, bool, 0644);
+MODULE_PARM_DESC(suspend_off, "power the camera island off for system suspend and boot the CCU again on resume (default: on)");
+
 struct ccu_boot {
 	struct device *dev;
 	void __iomem *hfrp;
@@ -94,6 +98,8 @@ struct ccu_boot {
 	phys_addr_t fw_phys;
 	size_t fw_len;
 	u8 *payload;		/* signed image without the type tag (fw_len - 4 bytes) */
+	bool up;		/* CCU firmware running and its HFRP power/clocks requested */
+	bool off_for_suspend;	/* powered off by suspend_late; boot again on resume */
 };
 
 /* ---------- HFRP power ---------- */
@@ -424,8 +430,6 @@ static int surface_ccu_boot_probe(struct platform_device *pdev)
 		}
 		while (nrej--)
 			free_pages((unsigned long)rejected[nrej], order);
-		kfree(cb->payload);
-		cb->payload = NULL;
 	}
 	if (ret) {
 		dev_err(dev, "ROT0 firmware load failed: %d\n", ret);
@@ -436,6 +440,7 @@ static int surface_ccu_boot_probe(struct platform_device *pdev)
 		goto out_poweroff;
 
 	platform_set_drvdata(pdev, cb);
+	cb->up = true;
 	dev_info(dev, "CCU up; leaving it powered\n");
 	return 0;
 
@@ -455,6 +460,69 @@ out_unmap:
 	return ret;
 }
 
+/* ---------- system sleep ---------- */
+
+/*
+ * The HFRP keeps the camera island (power domains 0/2/5 and the CCU clocks)
+ * on for as long as our "on" requests stand, and the probe never withdrew
+ * them. The island then stayed powered through s2idle, and the SoC
+ * occasionally reset as it entered its deepest idle state (DRIPS), leaving
+ * the RoT/HFRP side wedged until a full power cycle. Windows powers the
+ * camera off in standby. So withdraw the requests in suspend_late, after
+ * surface_ultra_cam has stopped streaming and withdrawn its own, and boot
+ * the CCU again in resume_early, before surface_ultra_cam resumes.
+ */
+static int ccu_boot_again(struct ccu_boot *cb)
+{
+	int ret;
+
+	ret = ccu_power(cb, true);
+	if (ret)
+		return ret;
+	ccu_init_regs(cb);
+	memcpy(cb->fw_buf, cb->payload, cb->fw_len - 4);
+	ret = rot_load_fw(cb);
+	ret = ret ?: ccu_handshake(cb);
+	if (ret)
+		ccu_power(cb, false);
+	return ret;
+}
+
+static int surface_ccu_boot_suspend_late(struct device *dev)
+{
+	struct ccu_boot *cb = dev_get_drvdata(dev);
+
+	if (!cb || !cb->up || !suspend_off)
+		return 0;
+	ccu_power(cb, false);
+	cb->up = false;
+	cb->off_for_suspend = true;
+	dev_info(dev, "camera island powered off for suspend\n");
+	return 0;
+}
+
+static int surface_ccu_boot_resume_early(struct device *dev)
+{
+	struct ccu_boot *cb = dev_get_drvdata(dev);
+	int ret;
+
+	if (!cb || !cb->off_for_suspend)
+		return 0;
+	cb->off_for_suspend = false;
+	ret = ccu_boot_again(cb);
+	if (ret) {
+		dev_err(dev, "CCU did not come back after suspend: %d (camera unavailable until reboot)\n", ret);
+		return 0;	/* never fail the system resume for the camera */
+	}
+	cb->up = true;
+	dev_info(dev, "CCU up again after suspend\n");
+	return 0;
+}
+
+static const struct dev_pm_ops surface_ccu_boot_pm = {
+	LATE_SYSTEM_SLEEP_PM_OPS(surface_ccu_boot_suspend_late, surface_ccu_boot_resume_early)
+};
+
 static const struct acpi_device_id surface_ccu_boot_acpi[] = {
 	{ "NVDA8600" },		/* ROT0 */
 	{ }
@@ -465,6 +533,7 @@ static struct platform_driver surface_ccu_boot_driver = {
 	.probe = surface_ccu_boot_probe,
 	.driver = {
 		.name = "surface-ccu-boot",
+		.pm = pm_sleep_ptr(&surface_ccu_boot_pm),
 		.acpi_match_table = surface_ccu_boot_acpi,
 		.probe_type = PROBE_FORCE_SYNCHRONOUS,
 	},
