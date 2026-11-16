@@ -12,6 +12,7 @@
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/ktime.h>
 #include <linux/unaligned.h>
 #include "sucam.h"
 #include "ov02c10_regs.h"
@@ -68,8 +69,17 @@
 #define SV_WDMA_BASIC_IMG2	(0x1000 + 0x250)
 
 /* ---------- HFRP (power/clock firmware mailbox) ---------- */
+/*
+ * As in surface_ccu_boot: out_sta can be set again after a reply was taken
+ * and cleared, and a status left there would answer the next message before
+ * the HFRP has handled it. Clear it first, and allow 5 s for the reply.
+ */
+#define HFRP_TIMEOUT_US	5000000
+
 static int hfrp_xfer(struct sucam *cam, const u8 *msg)
 {
+	ktime_t start;
+	s64 ms;
 	u32 sta;
 	int i, ret;
 
@@ -77,12 +87,23 @@ static int hfrp_xfer(struct sucam *cam, const u8 *msg)
 		usleep_range(1000, 1200);
 	if (readl(cam->hfrp + HFRP_IN_SET))
 		return -EBUSY;
+	sta = readl(cam->hfrp + HFRP_OUT_STA);
+	if (sta) {
+		dev_dbg(cam->dev, "hfrp: clearing a stale status 0x%x before msg %u\n", sta, msg[0]);
+		writel(sta, cam->hfrp + HFRP_OUT_CLR);
+	}
 	memcpy_toio(cam->hfrp, msg, HFRP_MSG_LEN);
 	wmb();
+	start = ktime_get();
 	writel(1, cam->hfrp + HFRP_IN_SET);
-	ret = readl_poll_timeout(cam->hfrp + HFRP_OUT_STA, sta, sta, 100, 1000000);
-	if (ret)
+	ret = readl_poll_timeout(cam->hfrp + HFRP_OUT_STA, sta, sta, 100, HFRP_TIMEOUT_US);
+	if (ret) {
+		dev_err(cam->dev, "hfrp: msg %u: no reply in %d ms\n", msg[0], HFRP_TIMEOUT_US / 1000);
 		return ret;
+	}
+	ms = ktime_ms_delta(ktime_get(), start);
+	if (ms >= 100)
+		dev_info(cam->dev, "hfrp: msg %u answered after %lld ms\n", msg[0], ms);
 	writel(sta, cam->hfrp + HFRP_OUT_CLR);
 	return 0;
 }
