@@ -25,6 +25,7 @@
 #include <linux/firmware.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/unaligned.h>
@@ -37,6 +38,12 @@
 #define HFRP_OUT_STA	0x104
 #define HFRP_OUT_CLR	0x10c
 #define HFRP_OK		0x80000000	/* out_sta after a message is accepted */
+/*
+ * Reply timeout. The HFRP usually answers within a few ms, but after an 8 h
+ * s2idle the first "domain 0 on" got no reply within 1 s and was answered
+ * later (out_sta still 0x80000000 with that message in the buffer).
+ */
+#define HFRP_TIMEOUT_US	5000000
 
 /* CCU needs seninf power domains 0 and 2 plus the CCU domain 5 */
 static const u32 ccu_domains[] = { 0, 2, 5 };
@@ -106,6 +113,8 @@ struct ccu_boot {
 
 static int hfrp_xfer(struct ccu_boot *cb, const u8 *msg, const char *what)
 {
+	ktime_t start;
+	s64 ms;
 	u32 sta;
 	int i, ret;
 
@@ -115,14 +124,24 @@ static int hfrp_xfer(struct ccu_boot *cb, const u8 *msg, const char *what)
 		dev_err(cb->dev, "hfrp: doorbell busy before %s\n", what);
 		return -EBUSY;
 	}
+	/* a reply that came after an earlier timeout would answer this message */
+	sta = readl(cb->hfrp + HFRP_OUT_STA);
+	if (sta) {
+		dev_warn(cb->dev, "hfrp: clearing a late reply 0x%x before %s\n", sta, what);
+		writel(sta, cb->hfrp + HFRP_OUT_CLR);
+	}
 	memcpy_toio(cb->hfrp, msg, HFRP_MSG_LEN);
 	wmb();
+	start = ktime_get();
 	writel(1, cb->hfrp + HFRP_IN_SET);
-	ret = readl_poll_timeout(cb->hfrp + HFRP_OUT_STA, sta, sta, 100, 1000000);
+	ret = readl_poll_timeout(cb->hfrp + HFRP_OUT_STA, sta, sta, 100, HFRP_TIMEOUT_US);
 	if (ret) {
-		dev_err(cb->dev, "hfrp: %s: no reply\n", what);
+		dev_err(cb->dev, "hfrp: %s: no reply in %d ms\n", what, HFRP_TIMEOUT_US / 1000);
 		return ret;
 	}
+	ms = ktime_ms_delta(ktime_get(), start);
+	if (ms >= 100)
+		dev_info(cb->dev, "hfrp: %s answered after %lld ms\n", what, ms);
 	writel(sta, cb->hfrp + HFRP_OUT_CLR);
 	if (sta != HFRP_OK)
 		dev_warn(cb->dev, "hfrp: %s: out_sta 0x%x (expected 0x%x)\n", what, sta, HFRP_OK);
@@ -477,8 +496,11 @@ static int ccu_boot_again(struct ccu_boot *cb)
 	int ret;
 
 	ret = ccu_power(cb, true);
-	if (ret)
+	if (ret) {
+		/* withdraw the domains that did come on */
+		ccu_power(cb, false);
 		return ret;
+	}
 	ccu_init_regs(cb);
 	memcpy(cb->fw_buf, cb->payload, cb->fw_len - 4);
 	ret = rot_load_fw(cb);
